@@ -4,10 +4,21 @@ Experimental geospatial-agumented wrapper around a ``pyarrow.dataset``.
 >>> import geoarrow.pyarrow.dataset as gads
 """
 
+import json
 from concurrent.futures import ThreadPoolExecutor, wait
 
 from geoarrow.pyarrow._kernel import Kernel
-from geoarrow.pyarrow._type import GeometryExtensionType, wkb, wkt
+from geoarrow.pyarrow._type import (
+    GeometryExtensionType,
+    linestring,
+    multilinestring,
+    multipoint,
+    multipolygon,
+    point,
+    polygon,
+    wkb,
+    wkt,
+)
 from geoarrow.types import CoordType
 
 import pyarrow as _pa
@@ -25,13 +36,17 @@ class GeoDataset:
     The GeoDataset wraps a pyarrow.Dataset containing one or more geometry columns
     and provides indexing and IO capability. If `geometry_columns` is `None`,
     it will include all columns that inherit from `geoarrow.pyarrow.GeometryExtensionType`.
-    The `geometry_columns` are not required to be geoarrow extension type columns:
-    text columns will be parsed as WKT; binary columns will be parsed as WKB
-    (but are not detected automatically).
+    For Parquet datasets, geometry columns declared by GeoParquet ``geo``
+    metadata are also detected. The `geometry_columns` are not required to be
+    geoarrow extension type columns: text columns will be parsed as WKT; binary
+    columns will be parsed as WKB (but are not detected automatically).
 
     Note that the ``GeoDataset`` is only useful in a context where each fragment
     has been written such that features in the fragment are close together
-    in space (e.g., one file or row group per state).
+    in space (e.g., one file or row group per state). To write a single
+    GeoParquet file whose row groups are spatially clustered, pass
+    ``spatial_bucketing`` to
+    :func:`geoarrow.pyarrow.io.write_geoparquet_table()`.
     """
 
     def __init__(self, parent, geometry_columns=None):
@@ -92,6 +107,13 @@ class GeoDataset:
     def geometry_columns(self):
         """Get a tuple of geometry column names
 
+        If ``geometry_columns`` was not specified, columns that inherit from
+        :class:`geoarrow.pyarrow.GeometryExtensionType` are used. For Parquet
+        datasets without GeoArrow extension types (e.g., those written by
+        :func:`geoarrow.pyarrow.io.write_geoparquet_table()` using the WKB
+        encoding), the geometry columns declared by the ``geo`` schema
+        metadata are used.
+
         >>> import geoarrow.pyarrow.dataset as gads
         >>> import geoarrow.pyarrow as ga
         >>> import pyarrow as pa
@@ -106,6 +128,10 @@ class GeoDataset:
             for name, type in zip(schema.names, schema.types):
                 if isinstance(type, GeometryExtensionType):
                     geometry_columns.append(name)
+
+            if not geometry_columns:
+                geometry_columns = _geoparquet_geometry_columns(schema)
+
             self._geometry_columns = tuple(geometry_columns)
 
         return self._geometry_columns
@@ -128,6 +154,7 @@ class GeoDataset:
         (WktType(geoarrow.wkt),)
         """
         if self._geometry_types is None:
+            specs = _geoparquet_geometry_specs(self.schema)
             geometry_types = []
             for col in self.geometry_columns:
                 type = self.schema.field(col).type
@@ -138,7 +165,15 @@ class GeoDataset:
                 elif _types.is_string(type):
                     geometry_types.append(wkt())
                 else:
-                    raise TypeError(f"Unsupported type for geometry column: {type}")
+                    spec = specs.get(col, {})
+                    encoding = spec.get("encoding")
+                    geoarrow_type = _GEOARROW_ENCODINGS_BY_NAME.get(encoding)
+                    if geoarrow_type is not None:
+                        geometry_types.append(geoarrow_type)
+                    else:
+                        raise TypeError(
+                            f"Unsupported type for geometry column: {type}"
+                        )
 
             self._geometry_types = tuple(geometry_types)
 
@@ -306,12 +341,80 @@ class GeoDataset:
             )
             expressions.append(expr)
 
+        # Without a geometry column there is nothing to prune: keep every
+        # fragment.
+        if not expressions:
+            return index.column(0)
+
         expr = expressions[0]
         for i in range(1, len(expressions)):
             expr = expr | expressions[i]
 
         result = _ds.dataset(index).filter(expr).to_table()
         return result.column(0)
+
+
+def _geoparquet_geometry_columns(schema):
+    """Find geometry columns declared by GeoParquet ``geo`` schema metadata
+
+    Returns an empty tuple if the schema has no ``geo`` metadata or if none of
+    the declared columns exist in ``schema``.
+    """
+    columns = _geoparquet_geometry_specs(schema)
+
+    # The primary geometry column comes first so that it is used preferentially
+    # when the dataset has more than one geometry column.
+    geo_meta = _geoparquet_metadata(schema) or {}
+    primary = geo_meta.get("primary_column")
+    ordered = []
+    if primary in columns:
+        ordered.append(primary)
+    ordered.extend(name for name in columns if name != primary)
+
+    return tuple(ordered)
+
+
+def _geoparquet_metadata(schema):
+    metadata = schema.metadata
+    if not metadata or b"geo" not in metadata:
+        return None
+
+    try:
+        geo_meta = json.loads(metadata[b"geo"])
+    except (TypeError, ValueError):
+        return None
+
+    return geo_meta if isinstance(geo_meta, dict) else None
+
+
+def _geoparquet_geometry_specs(schema):
+    geo_meta = _geoparquet_metadata(schema)
+    if geo_meta is None:
+        return {}
+
+    columns = geo_meta.get("columns")
+    if not isinstance(columns, dict):
+        return {}
+
+    schema_names = set(schema.names)
+    return {
+        name: spec
+        for name, spec in columns.items()
+        if name in schema_names and isinstance(spec, dict)
+    }
+
+
+# GeoParquet encoding name -> GeoArrow extension type. GeoParquet-encoded
+# geometry columns are written as their underlying struct/list storage, so the
+# dataset needs the encoding from the ``geo`` metadata to interpret them.
+_GEOARROW_ENCODINGS_BY_NAME = {
+    "point": point(),
+    "linestring": linestring(),
+    "polygon": polygon(),
+    "multipoint": multipoint(),
+    "multilinestring": multilinestring(),
+    "multipolygon": multipolygon(),
+}
 
 
 class ParquetRowGroupGeoDataset(GeoDataset):

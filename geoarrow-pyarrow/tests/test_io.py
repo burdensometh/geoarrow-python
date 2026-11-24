@@ -1,13 +1,62 @@
 import json
 import os
+import random
 import tempfile
 
 import geoarrow.pyarrow as ga
+import geoarrow.pyarrow.dataset as gads
 import pyarrow as pa
+import pyarrow.compute as pc
 import pytest
 from geoarrow import types
 from geoarrow.pyarrow import io
 from pyarrow import parquet
+
+
+def _station_table(num_side=20, cell_size=1.0, no_coord=4, seed=42):
+    """A table of stations whose rows are in a pseudo-random order"""
+    rows = []
+    for iy in range(num_side):
+        for ix in range(num_side):
+            rows.append(
+                {
+                    "id": iy * num_side + ix,
+                    "x": (ix + 0.5) * cell_size,
+                    "y": (iy + 0.5) * cell_size,
+                    "geometry": f"POINT ({(ix + 0.5) * cell_size} "
+                    f"{(iy + 0.5) * cell_size})",
+                }
+            )
+
+    random.Random(seed).shuffle(rows)
+    for i in range(no_coord):
+        rows.append(
+            {
+                "id": 1000 + i,
+                "x": None,
+                "y": None,
+                "geometry": None,
+            }
+        )
+
+    return pa.table(
+        {
+            "geometry": ga.as_geoarrow(pa.array([r["geometry"] for r in rows])),
+            "id": pa.array([r["id"] for r in rows], pa.int64()),
+            "x": pa.array([r["x"] for r in rows], pa.float64()),
+            "y": pa.array([r["y"] for r in rows], pa.float64()),
+        }
+    )
+
+
+def _recovered(table):
+    return table.take(pc.sort_indices(table[io.DEFAULT_ORIGINAL_ROW_COLUMN]))
+
+
+def _read_geo(path):
+    # WKB-encoded GeoParquet reads back as a plain binary column with
+    # ``parquet.read_table()``; use the GeoParquet reader to decode it.
+    return io.read_geoparquet_table(path)
 
 
 def test_readpyogrio_table_gpkg():
@@ -396,3 +445,349 @@ def test_table_to_geoarrow():
         tab_no_cols, {"col_name": {"encoding": "WKB"}}
     )
     assert tab_no_cols_geo == tab_no_cols
+
+
+def test_write_geoparquet_spatial_bucketing_default_off():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        temp_pq = os.path.join(tmpdir, "test.parquet")
+        tab = _station_table(num_side=4)
+        io.write_geoparquet_table(tab, temp_pq)
+
+        written = _read_geo(temp_pq)
+        assert io.DEFAULT_ORIGINAL_ROW_COLUMN not in written.column_names
+        assert written["id"].to_pylist() == tab["id"].to_pylist()
+        assert ga.format_wkt(written["geometry"]).to_pylist() == ga.format_wkt(
+            tab["geometry"]
+        ).to_pylist()
+
+
+def test_write_geoparquet_spatial_bucketing_recovers_original_order():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        temp_pq = os.path.join(tmpdir, "test.parquet")
+        tab = _station_table(num_side=10)
+        io.write_geoparquet_table(tab, temp_pq, spatial_bucketing=2.0, row_group_size=8)
+
+        written = _read_geo(temp_pq)
+
+        # Every row is present exactly once and the original row number
+        # column is a permutation of 0..n-1.
+        original = written[io.DEFAULT_ORIGINAL_ROW_COLUMN]
+        assert sorted(original.to_pylist()) == list(range(tab.num_rows))
+
+        # Reordering by the original row number recovers the input order.
+        recovered = _recovered(written)
+        assert recovered["id"].to_pylist() == tab["id"].to_pylist()
+        assert ga.format_wkt(recovered["geometry"]).to_pylist() == ga.format_wkt(
+            tab["geometry"]
+        ).to_pylist()
+
+
+def test_write_geoparquet_spatial_bucketing_no_coordinate_rows_last():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        temp_pq = os.path.join(tmpdir, "test.parquet")
+        tab = _station_table(num_side=6, no_coord=5)
+        io.write_geoparquet_table(
+            tab,
+            temp_pq,
+            geometry_encoding="point",
+            spatial_bucketing=3.0,
+            row_group_size=4,
+        )
+
+        written = _read_geo(temp_pq)
+        # The no-coordinate records are written last, in their own row groups.
+        assert written["id"].to_pylist()[-5:] == list(range(1000, 1005))
+
+        pf = parquet.ParquetFile(temp_pq)
+        last_row_group = pf.metadata.row_group(pf.metadata.num_row_groups - 1)
+        for i in range(last_row_group.num_columns):
+            column = last_row_group.column(i)
+            if column.path_in_schema.startswith("geometry"):
+                assert column.statistics.has_min_max is False
+
+        # And the spatial buckets do not include the no-coordinate records.
+        dataset = gads.dataset(temp_pq)
+        filtered = dataset.filter_fragments(
+            "POLYGON ((-1 -1, -1 100, 100 100, 100 -1, -1 -1))"
+        )
+        assert 1000 not in filtered.to_table()["id"].to_pylist()
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        2.5,
+        (2.5, 2.5),
+        (0.0, 0.0, 2.5, 2.5),
+        {"cell_size": 2.5},
+        {"num_cells": 4},
+        {"num_cells_x": 4, "num_cells_y": 2},
+        {"dx": 2.5, "dy": 2.5, "origin_x": 0.0, "origin_y": 0.0},
+        True,
+    ],
+)
+def test_write_geoparquet_spatial_bucketing_spec_forms(spec):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        temp_pq = os.path.join(tmpdir, "test.parquet")
+        tab = _station_table(num_side=8, no_coord=3)
+        io.write_geoparquet_table(
+            tab, temp_pq, spatial_bucketing=spec, row_group_size=7
+        )
+
+        written = _read_geo(temp_pq)
+        assert sorted(written[io.DEFAULT_ORIGINAL_ROW_COLUMN].to_pylist()) == list(
+            range(tab.num_rows)
+        )
+        assert _recovered(written)["id"].to_pylist() == tab["id"].to_pylist()
+
+
+def test_write_geoparquet_spatial_bucketing_row_group_size():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        temp_pq = os.path.join(tmpdir, "test.parquet")
+        tab = _station_table(num_side=10, no_coord=0)
+        io.write_geoparquet_table(
+            tab, temp_pq, spatial_bucketing={"cell_size": 1.0}, row_group_size=3
+        )
+
+        pf = parquet.ParquetFile(temp_pq)
+        sizes = [
+            pf.metadata.row_group(i).num_rows
+            for i in range(pf.metadata.num_row_groups)
+        ]
+        assert sizes
+        assert max(sizes) <= 3
+
+        # Every row is still present exactly once and in the same order after
+        # recovery.
+        recovered = _recovered(_read_geo(temp_pq))
+        assert recovered["id"].to_pylist() == tab["id"].to_pylist()
+
+
+def test_write_geoparquet_spatial_bucketing_metadata_and_roundtrip():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        temp_pq = os.path.join(tmpdir, "test.parquet")
+        tab = _station_table(num_side=6, no_coord=2)
+        io.write_geoparquet_table(tab, temp_pq, spatial_bucketing=2.0, row_group_size=5)
+
+        raw = parquet.read_table(temp_pq)
+        assert b"geo" in raw.schema.metadata
+        meta = json.loads(raw.schema.metadata[b"geo"])
+        assert meta["primary_column"] == "geometry"
+
+        # The geo metadata is not applied to the original row number column.
+        assert io.DEFAULT_ORIGINAL_ROW_COLUMN not in meta["columns"]
+
+        geo = io.read_geoparquet_table(temp_pq)
+        assert isinstance(geo["geometry"].type, ga.GeometryExtensionType)
+        assert geo["geometry"].type == ga.wkb()
+        assert geo.num_rows == tab.num_rows
+
+
+def test_write_geoparquet_spatial_bucketing_filters_row_groups():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        random_pq = os.path.join(tmpdir, "random.parquet")
+        bucketed_pq = os.path.join(tmpdir, "bucketed.parquet")
+
+        tab = _station_table(num_side=40, cell_size=10.0, no_coord=0)
+        io.write_geoparquet_table(tab, random_pq, row_group_size=256)
+        io.write_geoparquet_table(
+            tab, bucketed_pq, spatial_bucketing=20.0, row_group_size=256
+        )
+
+        window = "POLYGON ((0 0, 0 20, 20 20, 20 0, 0 0))"
+        random_dataset = gads.dataset(random_pq)
+        bucketed_dataset = gads.dataset(bucketed_pq)
+
+        random_fragments = random_dataset.filter_fragments(window).get_fragments()
+        bucketed_fragments = bucketed_dataset.filter_fragments(window).get_fragments()
+
+        # The bucketed file has more row groups, but a local window only
+        # needs a small fraction of them.
+        assert len(bucketed_fragments) < len(random_fragments)
+        assert len(bucketed_fragments) <= 2
+
+        # The candidate fragments still contain all of the features that
+        # intersect the window.
+        expected_ids = [
+            row["id"]
+            for row in tab.to_pylist()
+            if 0 < row["x"] < 20 and 0 < row["y"] < 20
+        ]
+        actual_ids = bucketed_dataset.filter_fragments(window).to_table()["id"]
+        assert sorted(actual_ids.to_pylist()) == sorted(expected_ids)
+
+
+def test_write_geoparquet_spatial_bucketing_original_row_column_options():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        temp_pq = os.path.join(tmpdir, "test.parquet")
+        tab = _station_table(num_side=4)
+
+        # The name of the original row column can be chosen.
+        io.write_geoparquet_table(
+            tab, temp_pq, spatial_bucketing=1.0, original_row_column="row_id"
+        )
+        written = parquet.read_table(temp_pq)
+        assert "row_id" in written.column_names
+        assert sorted(written["row_id"].to_pylist()) == list(range(tab.num_rows))
+
+        # ...or omitted.
+        io.write_geoparquet_table(
+            tab, temp_pq, spatial_bucketing=1.0, original_row_column=None
+        )
+        written = parquet.read_table(temp_pq)
+        assert written.column_names == tab.column_names
+
+        # An existing non-integer column cannot be repurposed.
+        with pytest.raises(ValueError, match="not integer-typed"):
+            io.write_geoparquet_table(
+                tab, temp_pq, spatial_bucketing=1.0, original_row_column="geometry"
+            )
+
+
+def test_write_geoparquet_spatial_bucketing_preserves_existing_original_rows():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        first_pq = os.path.join(tmpdir, "first.parquet")
+        second_pq = os.path.join(tmpdir, "second.parquet")
+
+        tab = _station_table(num_side=6)
+        io.write_geoparquet_table(
+            tab, first_pq, spatial_bucketing=2.0, row_group_size=5
+        )
+
+        # Re-bucket an already bucketed file: the original row numbers refer
+        # to the first write and must survive.
+        first = _read_geo(first_pq)
+        io.write_geoparquet_table(
+            first, second_pq, spatial_bucketing=1.0, row_group_size=3
+        )
+
+        second = _read_geo(second_pq)
+        assert sorted(second[io.DEFAULT_ORIGINAL_ROW_COLUMN].to_pylist()) == list(
+            range(tab.num_rows)
+        )
+        recovered = _recovered(second)
+        assert recovered["id"].to_pylist() == tab["id"].to_pylist()
+
+
+def test_write_geoparquet_spatial_bucketing_validation():
+    tab = _station_table(num_side=4)
+
+    with pytest.raises(ValueError, match="must have 2 or 4 elements"):
+        io.write_geoparquet_table(
+            tab, "/tmp/discard.parquet", spatial_bucketing=(1, 2, 3)
+        )
+
+    with pytest.raises(ValueError, match="cell_width"):
+        io.write_geoparquet_table(tab, "/tmp/discard.parquet", spatial_bucketing=0)
+
+    with pytest.raises(ValueError, match="must specify a cell size"):
+        io.write_geoparquet_table(
+            tab, "/tmp/discard.parquet", spatial_bucketing={"origin_x": 0}
+        )
+
+    with pytest.raises(ValueError, match="without a geometry column"):
+        io.write_geoparquet_table(
+            pa.table(
+                {
+                    "geometry": pa.chunked_array(
+                        [pa.array([{"x": 1.0, "y": 2.0}])]
+                    ),
+                    "id": pa.array([1]),
+                }
+            ),
+            "/tmp/discard.parquet",
+            spatial_bucketing=1.0,
+        )
+
+
+def test_write_geoparquet_spatial_bucketing_edge_cases():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        temp_pq = os.path.join(tmpdir, "test.parquet")
+
+        # All rows lack coordinates.
+        tab = pa.table(
+            {
+                "geometry": ga.as_wkb(pa.array([None, None, None], pa.string())),
+                "id": pa.array([0, 1, 2], pa.int64()),
+            }
+        )
+        io.write_geoparquet_table(tab, temp_pq, spatial_bucketing=1.0)
+        written = parquet.read_table(temp_pq)
+        assert written.num_rows == 3
+        assert written["id"].to_pylist() == [0, 1, 2]
+
+        # Empty input.
+        empty = tab.slice(0, 0)
+        io.write_geoparquet_table(empty, temp_pq, spatial_bucketing=1.0)
+        written = parquet.read_table(temp_pq)
+        assert written.num_rows == 0
+
+        # Non-finite (very large) coordinates do not overflow bucketing.
+        tab = pa.table(
+            {
+                "geometry": ga.array(["POINT (1e300 -1e300)", "POINT (1 2)"]),
+                "id": pa.array([0, 1], pa.int64()),
+            }
+        )
+        io.write_geoparquet_table(tab, temp_pq, spatial_bucketing=1.0)
+        written = _read_geo(temp_pq)
+        assert sorted(
+            written[io.DEFAULT_ORIGINAL_ROW_COLUMN].to_pylist()
+        ) == [0, 1]
+
+
+def test_write_geoparquet_spatial_bucketing_file_like_and_where():
+    import io as stdlib_io
+
+    tab = _station_table(num_side=4)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        temp_pq = os.path.join(tmpdir, "test.parquet")
+        # ``where`` can be passed by keyword.
+        io.write_geoparquet_table(tab, where=temp_pq, spatial_bucketing=1.0)
+        assert parquet.read_table(temp_pq).num_rows == tab.num_rows
+
+    # ...or as a file-like object.
+    buffer = stdlib_io.BytesIO()
+    io.write_geoparquet_table(tab, buffer, spatial_bucketing=1.0)
+    buffer.seek(0)
+    assert parquet.read_table(buffer).num_rows == tab.num_rows
+
+
+def test_geodataset_detects_geoparquet_geometry_columns():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        temp_pq = os.path.join(tmpdir, "test.parquet")
+
+        expected_types = {"WKB": ga.wkb(), "point": ga.point(), None: ga.point()}
+        for encoding, expected_type in expected_types.items():
+            tab = pa.table(
+                {
+                    "geometry": ga.as_geoarrow(["POINT (0 0)", "POINT (1 1)"]),
+                    "id": pa.array([0, 1], pa.int64()),
+                }
+            )
+            io.write_geoparquet_table(
+                tab,
+                temp_pq,
+                row_group_size=1,
+                geometry_encoding=encoding,
+                spatial_bucketing=1.0,
+            )
+
+            dataset = gads.dataset(temp_pq)
+            assert dataset.geometry_columns == ("geometry",)
+            assert dataset.geometry_types == (expected_type,)
+            assert len(dataset.get_fragments()) == 2
+
+            filtered = dataset.filter_fragments(
+                "POLYGON ((0.5 0.5, 0.5 2, 2 2, 2 0.5, 0.5 0.5))"
+            )
+            assert filtered.to_table()["id"].to_pylist() == [1]
+
+
+def test_geodataset_without_geometry_columns_keeps_everything():
+    table = pa.table({"id": pa.array([1, 2, 3])})
+    dataset = gads.dataset(table)
+    assert dataset.geometry_columns == ()
+    filtered = dataset.filter_fragments("POLYGON ((0 0, 0 1, 1 1, 1 0, 0 0))")
+    assert filtered.to_table().num_rows == 3
