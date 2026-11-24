@@ -6,6 +6,7 @@ Experimental geospatial-agumented wrapper around a ``pyarrow.dataset``.
 
 from concurrent.futures import ThreadPoolExecutor, wait
 
+from geoarrow.pyarrow._compute import as_wkb
 from geoarrow.pyarrow._kernel import Kernel
 from geoarrow.pyarrow._type import GeometryExtensionType, wkb, wkt
 from geoarrow.types import CoordType
@@ -220,6 +221,197 @@ class GeoDataset:
         fragment_indices = [scalar.as_py() for scalar in maybe_intersects]
         filtered_parent = self._filter_parent_fragment_indices(fragment_indices)
         return self._wrap_parent(filtered_parent, fragment_indices)
+
+    def scan_fragments(
+        self,
+        target,
+        geometry_column=None,
+        columns=None,
+        num_threads=None,
+    ):
+        """Precise row-level spatial scan of a GeoDataset
+
+        Unlike :meth:`filter_fragments`, which only prunes whole fragments
+        using their envelope and may therefore leave rows whose geometry falls
+        outside the query area, this method applies an exact intersection test
+        to every row of the geometry column named by ``geometry_column``.
+
+        The scan happens in two stages:
+
+        1. The fragment index built by :meth:`index_fragments` is reused for an
+           envelope-level pre-filter, so fragments that cannot possibly
+           intersect ``target`` are never read.
+        2. Each remaining fragment is scanned one record batch at a time; the
+           specified geometry column is decoded to WKB and every feature is
+           tested against ``target`` using Shapely's ``intersects`` predicate.
+
+        Semantics of the precise test:
+
+        * Features whose geometry intersects ``target`` (including features that
+          only touch the polygon boundary) are retained.
+        * Null geometry values are excluded (the predicate evaluates to false).
+        * Empty geometries are excluded (an empty geometry intersects nothing).
+
+        The result is a materialized ``pyarrow.Table`` containing only the
+        requested ``columns`` (all columns when ``columns`` is ``None``); the
+        geometry column needed for the scan is always included even if it was
+        not explicitly requested. This method requires Shapely, which is used
+        only for the row-level predicate.
+
+        >>> import geoarrow.pyarrow.dataset as gads
+        >>> import geoarrow.pyarrow as ga
+        >>> import pyarrow as pa
+        >>> table = pa.table(
+        ...     [
+        ...         ga.array(
+        ...             [
+        ...                 "POINT (0.5 1.5)",
+        ...                 "POINT (5 5)",
+        ...                 "POINT (0 1)",
+        ...             ]
+        ...         )
+        ...     ],
+        ...     ["geometry"],
+        ... )
+        >>> dataset = gads.dataset(table)
+        >>> result = dataset.scan_fragments(
+        ...     "POLYGON ((0 0, 0 2, 2 2, 2 0, 0 0))"
+        ... )
+        >>> result.num_rows
+        2
+        >>> result.column("geometry").to_pylist()
+        ['POINT (0.5 1.5)', 'POINT (0 1)']
+        """
+        if geometry_column is None:
+            if len(self.geometry_columns) != 1:
+                raise ValueError(
+                    "geometry_column must be specified when the dataset has "
+                    "more than one geometry column"
+                )
+            geometry_column = self.geometry_columns[0]
+        elif geometry_column not in self.geometry_columns:
+            raise ValueError(
+                f"'{geometry_column}' is not one of the dataset geometry "
+                f"columns: {self.geometry_columns}"
+            )
+
+        if columns is not None:
+            columns = list(columns)
+            missing = [name for name in columns if name not in self.schema.names]
+            if missing:
+                raise ValueError(f"Columns not found in dataset schema: {missing}")
+            if geometry_column not in columns:
+                columns.append(geometry_column)
+        else:
+            columns = list(self.schema.names)
+
+        target_geometry, target_box = GeoDataset._prepare_scan_target(target)
+
+        # Stage 1: reuse the fragment index for an envelope-level pre-filter so
+        # fragments that cannot intersect the target are never opened.
+        maybe_intersects = GeoDataset._index_box_intersects(
+            self.index_fragments(), target_box, self.geometry_columns
+        )
+        fragment_indices = [scalar.as_py() for scalar in maybe_intersects]
+        if not fragment_indices:
+            return self.schema.empty_table().select(columns)
+
+        # Stage 2: exact, row-level intersection within the candidate fragments.
+        fragments = self.get_fragments()
+        candidate_fragments = [fragments[i] for i in fragment_indices]
+        geometry_type = self.geometry_types[
+            self.geometry_columns.index(geometry_column)
+        ]
+
+        if num_threads is None:
+            num_threads = _pa.cpu_count()
+
+        with ThreadPoolExecutor(max_workers=num_threads) as executor:
+            futures = [
+                executor.submit(
+                    GeoDataset._scan_fragment,
+                    fragment,
+                    geometry_column,
+                    geometry_type,
+                    target_geometry,
+                    columns,
+                )
+                for fragment in candidate_fragments
+            ]
+            wait(futures)
+            batches = [future.result() for future in futures]
+
+        batches = [batch for batch in batches if batch.num_rows > 0]
+        if not batches:
+            return self.schema.empty_table().select(columns)
+
+        projected_schema = self.schema.empty_table().select(columns).schema
+        return _pa.Table.from_batches(batches, schema=projected_schema)
+
+    @staticmethod
+    def _prepare_scan_target(target):
+        """Normalize the scan target into a Shapely geometry and its box.
+
+        The target may be a WKT/WKB string, a Shapely geometry, or any
+        geoarrow-like array of one or more geometries (multiple geometries are
+        unioned into a single query geometry). Returns a
+        ``(shapely_geometry, box_dict)`` tuple where the box uses the
+        xmin/ymin/xmax/ymax keys expected by :meth:`_index_box_intersects`.
+        """
+        try:
+            import shapely
+        except ImportError as e:
+            raise ImportError(
+                "scan_fragments() requires Shapely for the row-level "
+                "intersection test"
+            ) from e
+
+        if isinstance(target, str):
+            target = [target]
+
+        if isinstance(target, shapely.Geometry):
+            geometries = [target]
+        else:
+            wkb_array = as_wkb(target)
+            geometries = list(shapely.from_wkb(wkb_array.storage.to_pylist()))
+
+        if len(geometries) == 1:
+            union = geometries[0]
+        else:
+            union = shapely.union_all(geometries)
+
+        if union.is_empty:
+            box = {"xmin": None, "ymin": None, "xmax": None, "ymax": None}
+        else:
+            minx, miny, maxx, maxy = union.bounds
+            box = {"xmin": minx, "ymin": miny, "xmax": maxx, "ymax": maxy}
+
+        return union, box
+
+    @staticmethod
+    def _scan_fragment(fragment, column, geometry_type, target, columns):
+        """Apply the exact intersects predicate to every row of one fragment."""
+        import shapely
+
+        reader = fragment.scanner(columns=columns).to_reader()
+        kept_batches = []
+
+        for batch in reader:
+            geometry_array = geometry_type.wrap_array(batch.column(column))
+            wkb_storage = as_wkb(geometry_array).storage
+
+            # Null and empty geometries parse to None / empty Shapely geometry;
+            # shapely.intersects returns False for both, so they are excluded.
+            geometries = shapely.from_wkb(wkb_storage.to_pylist())
+            mask = _pa.array(shapely.intersects(geometries, target))
+            kept = batch.filter(mask)
+            if kept.num_rows > 0:
+                kept_batches.append(kept)
+
+        if not kept_batches:
+            return _pa.record_batch([], schema=reader.schema)
+
+        return _pa.concat_batches(kept_batches)
 
     def _wrap_parent(self, filtered_parent, fragment_indices):
         new_wrapped = GeoDataset(
