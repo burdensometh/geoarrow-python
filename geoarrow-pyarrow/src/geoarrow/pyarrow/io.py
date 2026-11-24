@@ -7,6 +7,7 @@ testing and documenting the GeoArrow format and encodings.
 """
 
 import json
+from typing import NamedTuple
 
 import geoarrow.pyarrow as _ga
 from geoarrow.pyarrow import _compute, _type
@@ -166,8 +167,40 @@ def write_geoparquet_table(
     `write_geometry_types=False`` to force omitting geometry types even when
     this value is type-constant.
 
+    The ``geometry_encoding`` argument controls how geometry columns are
+    serialized: ``"WKB"`` (the default) encodes every geometry column as
+    well-known binary, a native GeoArrow encoding value (e.g., ``"point"``)
+    applies that encoding to every geometry column, and a
+    :class:`GeometryEncodingPlan` assigns each geometry column an explicit
+    encoding of its own (see :func:`plan_geometry_encoding`). When a plan is
+    given, it must cover every geometry column that will be written.
+
     See :func:`read_geoparquet_table()` for examples.
     """
+    if isinstance(geometry_encoding, GeometryEncodingPlan):
+        plan = geometry_encoding
+
+        unknown_columns = [name for name in plan if name not in table.schema.names]
+        if unknown_columns:
+            raise ValueError(
+                "Encoding plan contains columns not present in the table: "
+                + ", ".join(unknown_columns)
+            )
+
+        if geometry_columns is None:
+            # Detect geometry columns as usual and require the plan to cover
+            # every one of them (enforced by plan.encoding_for() when column
+            # specifications are built).
+            detected_columns = [
+                name
+                for name, type in zip(table.schema.names, table.schema.types)
+                if isinstance(type, _ga.GeometryExtensionType)
+            ]
+            plan_columns = [*detected_columns, *plan]
+            if primary_geometry_column is not None:
+                plan_columns.append(primary_geometry_column)
+            geometry_columns = list(dict.fromkeys(plan_columns))
+
     geo_meta = _geoparquet_metadata_from_schema(
         table.schema,
         primary_geometry_column=primary_geometry_column,
@@ -195,6 +228,297 @@ def write_geoparquet_table(
     metadata["geo"] = json.dumps(geo_meta)
     table = table.replace_schema_metadata(metadata)
     return _pq.write_table(table, *args, **kwargs)
+
+
+class ColumnEncodingPlan(NamedTuple):
+    """The planned export encoding for a single geometry column
+
+    Parameters
+    ----------
+    encoding : str
+        The GeoParquet encoding that will be used to write the column
+        (e.g., ``"WKB"`` or ``"point"``).
+    reason : str
+        A human-readable description of why this encoding was chosen.
+    geometry_types : tuple of str
+        The geometry type labels (e.g., ``"Point Z"``) that were observed
+        in the column when the plan was created.
+    expected_type : geoarrow.pyarrow.GeometryExtensionType or None
+        The GeoArrow type that a compliant reader reconstructs when reading
+        the exported column back, or ``None`` if this was not computed when
+        the plan was created. This carries the CRS, edge type, and
+        dimensions of the column such that a round trip can be verified.
+    """
+
+    encoding: str
+    reason: str = ""
+    geometry_types: tuple = ()
+    expected_type: _ga.GeometryExtensionType = None
+
+
+class GeometryEncodingPlan:
+    """An explicit per-column encoding plan for geometry export
+
+    A plan assigns every geometry column of a table exactly one encoding
+    (e.g., standard well-known binary or a native GeoArrow encoding) along
+    with a human-readable reason for the decision. Plans are usually created
+    by :func:`plan_geometry_encoding`, which inspects the geometry types and
+    dimensions that actually occur in each column, and are applied by
+    passing them to :func:`write_geoparquet_table` as ``geometry_encoding``.
+    A plan can also be built by hand from :class:`ColumnEncodingPlan` values
+    to force a specific encoding for a column.
+
+    >>> import geoarrow.pyarrow as ga
+    >>> from geoarrow.pyarrow import io
+    >>> import pyarrow as pa
+    >>> tab = pa.table({
+    ...     "points": ga.array(["POINT (0 1)", None]),
+    ...     "lines": ga.array(["LINESTRING (0 0, 1 1)", None]),
+    ... })
+    >>> plan = io.plan_geometry_encoding(tab)
+    >>> print(plan)
+    GeometryEncodingPlan(
+      points: point (all features are Point)
+      lines: WKB (observed geometry types 'LineString' cannot be represented with native point encoding)
+    )
+    """
+
+    def __init__(self, columns):
+        columns = dict(columns)
+        for name, column_plan in columns.items():
+            if not isinstance(column_plan, ColumnEncodingPlan):
+                raise TypeError(
+                    f"Column plan for '{name}' is not a ColumnEncodingPlan"
+                )
+            if column_plan.encoding not in _PLAN_ENCODINGS:
+                valid = ", ".join(sorted(_PLAN_ENCODINGS))
+                raise ValueError(
+                    f"Invalid encoding '{column_plan.encoding}' for column "
+                    f"'{name}': expected one of {valid}"
+                )
+
+        self._columns = columns
+
+    @property
+    def column_names(self):
+        """The names of the columns covered by this plan as a tuple."""
+        return tuple(self._columns)
+
+    @property
+    def encodings(self):
+        """A dict mapping each column name to its planned encoding."""
+        return {name: plan.encoding for name, plan in self._columns.items()}
+
+    def encoding_for(self, name):
+        """Look up the planned encoding for a column
+
+        Raises a ``ValueError`` if ``name`` is not covered by this plan.
+        """
+        if name not in self._columns:
+            raise ValueError(f"Column '{name}' is not covered by this encoding plan")
+        return self._columns[name].encoding
+
+    def __getitem__(self, name):
+        return self._columns[name]
+
+    def __contains__(self, name):
+        return name in self._columns
+
+    def __iter__(self):
+        return iter(self._columns)
+
+    def __len__(self):
+        return len(self._columns)
+
+    def __eq__(self, other):
+        if not isinstance(other, GeometryEncodingPlan):
+            return NotImplemented
+        return self._columns == other._columns
+
+    def __repr__(self):
+        if not self._columns:
+            return "GeometryEncodingPlan()"
+
+        lines = ["GeometryEncodingPlan("]
+        for name, column_plan in self._columns.items():
+            lines.append(f"  {name}: {column_plan.encoding} ({column_plan.reason})")
+        lines.append(")")
+        return "\n".join(lines)
+
+
+def plan_geometry_encoding(table, geometry_columns=None):
+    """Create an explicit encoding plan for exporting a table
+
+    Inspects the geometry types and dimensions that actually occur in each
+    geometry column of ``table`` and chooses exactly one encoding per
+    column: columns whose features are all points with uniform dimensions
+    can be consumed natively by Arrow-based engines and are assigned the
+    native GeoArrow ``"point"`` encoding; all other columns fall back to
+    standard well-known binary (``"WKB"``), which any GeoParquet consumer
+    can read. The resulting :class:`GeometryEncodingPlan` records, for
+    every column, the encoding that will be used and the reason for the
+    decision. Pass it to :func:`write_geoparquet_table` as
+    ``geometry_encoding`` to apply it.
+
+    Null values do not affect the decision: they are ignored when
+    inspecting a column and are preserved by both encodings. Note that
+    with the native point encoding, empty points are represented as
+    ``nan`` coordinates as described by the GeoArrow specification.
+
+    Parameters
+    ----------
+    table : pyarrow.Table
+        The table to plan for. Columns are scanned as-is, so columns
+        encoded as well-known text or binary are parsed to compute the
+        geometry types and dimensions that occur.
+    geometry_columns : list of str, optional
+        The columns to plan encodings for. If not specified, all columns
+        with a GeoArrow extension type are used.
+
+    Returns
+    -------
+    GeometryEncodingPlan
+        The plan. In addition to the encoding and reason for each column,
+        each :class:`ColumnEncodingPlan` carries the type a compliant
+        reader will reconstruct on read-back (``expected_type``), such
+        that the CRS, nulls, and type identity of a round trip can be
+        verified.
+
+    Examples
+    --------
+    >>> import geoarrow.pyarrow as ga
+    >>> from geoarrow.pyarrow import io
+    >>> import pyarrow as pa
+    >>> tab = pa.table({
+    ...     "geometry": ga.with_crs(ga.array(["POINT (0 1)", None]), ga.OGC_CRS84),
+    ...     "lines": ga.array(["LINESTRING (0 0, 1 1)", None]),
+    ... })
+    >>> plan = io.plan_geometry_encoding(tab)
+    >>> plan.encodings
+    {'geometry': 'point', 'lines': 'WKB'}
+    >>> plan["lines"].reason
+    "observed geometry types 'LineString' cannot be represented with native point encoding"
+
+    The plan is applied by passing it to :func:`write_geoparquet_table`,
+    after which the read-back type of every column can be checked against
+    the type the plan predicted:
+
+    >>> import tempfile
+    >>> import os
+    >>> with tempfile.TemporaryDirectory() as tmpdir:
+    ...     path = os.path.join(tmpdir, "test.parquet")
+    ...     io.write_geoparquet_table(tab, path, geometry_encoding=plan)
+    ...     tab2 = io.read_geoparquet_table(path)
+    >>> tab2["geometry"].type == plan["geometry"].expected_type
+    True
+    >>> tab2["geometry"].type.crs == ga.OGC_CRS84
+    True
+    >>> tab2["geometry"].is_null().to_pylist()
+    [False, True]
+    """
+    schema = table.schema
+
+    if geometry_columns is None:
+        geometry_columns = [
+            name
+            for name, type in zip(schema.names, schema.types)
+            if isinstance(type, _ga.GeometryExtensionType)
+        ]
+    else:
+        geometry_columns = list(geometry_columns)
+        missing_columns = [
+            name for name in geometry_columns if name not in schema.names
+        ]
+        if missing_columns:
+            raise ValueError(
+                "Geometry columns not present in the table: "
+                + ", ".join(missing_columns)
+            )
+
+    columns = {}
+    for name in geometry_columns:
+        columns[name] = _plan_column_encoding(table[name], schema.field(name).type)
+
+    return GeometryEncodingPlan(columns)
+
+
+def _plan_column_encoding(item, type):
+    unique_types = _ga.unique_geometry_types(item).to_pylist()
+    observed = {
+        (_ga.GeometryType(el["geometry_type"]), _ga.Dimensions(el["dimensions"]))
+        for el in unique_types
+    }
+    labels = tuple(sorted(_geometry_type_label(*el) for el in observed))
+
+    geometry_types = {el[0] for el in observed}
+    dimensions = {el[1] for el in observed}
+
+    if not observed:
+        encoding = "WKB"
+        reason = "no non-null features; native point eligibility cannot be verified"
+        point_dimensions = None
+    elif geometry_types == {_ga.GeometryType.POINT} and len(dimensions) == 1:
+        encoding = "point"
+        point_dimensions = next(iter(dimensions))
+        reason = f"all features are {labels[0]}"
+    else:
+        encoding = "WKB"
+        point_dimensions = None
+        if geometry_types == {_ga.GeometryType.POINT}:
+            dims = ", ".join(
+                repr(d.name) for d in sorted(dimensions, key=lambda d: d.value)
+            )
+            reason = (
+                f"point features have mixed dimensions {dims}; "
+                "native point encoding requires uniform dimensions"
+            )
+        else:
+            geometry_type_list = ", ".join(repr(label) for label in labels)
+            reason = (
+                f"observed geometry types {geometry_type_list} "
+                "cannot be represented with native point encoding"
+            )
+
+    expected_type = _planned_readback_type(encoding, point_dimensions, type)
+    return ColumnEncodingPlan(encoding, reason, labels, expected_type)
+
+
+def _planned_readback_type(encoding, dimensions, source_type):
+    if isinstance(source_type, _ga.GeometryExtensionType):
+        crs = source_type.crs
+        edge_type = source_type.edge_type
+    else:
+        # A column without GeoArrow type metadata carries no explicit CRS;
+        # GeoParquet readers reconstruct it with the default lon/lat CRS.
+        crs = _CRS_LONLAT
+        edge_type = _ga.EdgeType.PLANAR
+
+    if encoding == "point":
+        type_out = _ga.point().with_dimensions(dimensions)
+    else:
+        type_out = _ga.wkb()
+
+    if crs is not None:
+        type_out = type_out.with_crs(crs)
+
+    if edge_type != _ga.EdgeType.PLANAR:
+        type_out = type_out.with_edge_type(edge_type)
+
+    return type_out
+
+
+def _geometry_type_label(geometry_type, dimensions):
+    if 0 <= geometry_type.value < len(_GEOPARQUET_GEOMETRY_TYPE_LABELS):
+        type_label = _GEOPARQUET_GEOMETRY_TYPE_LABELS[geometry_type.value]
+    else:
+        type_label = geometry_type.name.capitalize()
+
+    if dimensions.value > 0:
+        dimensions_label = _GEOPARQUET_DIMENSION_LABELS[dimensions.value]
+    else:
+        dimensions_label = ""
+
+    return f"{type_label}{dimensions_label}"
 
 
 def _geoparquet_guess_geometry_columns(schema):
@@ -279,7 +603,9 @@ def _geoparquet_table_to_geoarrow(tab, columns):
     return tab
 
 
-def _geoparquet_guess_primary_geometry_column(schema, primary_geometry_column=None):
+def _geoparquet_guess_primary_geometry_column(
+    schema, primary_geometry_column=None, geometry_columns=None
+):
     if primary_geometry_column is not None:
         return primary_geometry_column
 
@@ -293,6 +619,13 @@ def _geoparquet_guess_primary_geometry_column(schema, primary_geometry_column=No
     for name, type in zip(schema.names, schema.types):
         if isinstance(type, _ga.GeometryExtensionType):
             return name
+
+    # ...falling back to the first explicitly declared geometry column
+    # (e.g., a column named in an encoding plan that has no GeoArrow type)
+    if geometry_columns is not None:
+        for name in geometry_columns:
+            if name in schema.names:
+                return name
 
     raise ValueError(
         "write_geoparquet_table() requires source with at least one geometry column"
@@ -361,8 +694,13 @@ def _geoparquet_columns_from_schema(
     specs = {}
     for name, type in zip(schema_names, schema_types):
         if name in geometry_columns:
+            if isinstance(encoding, GeometryEncodingPlan):
+                column_encoding = encoding.encoding_for(name)
+            else:
+                column_encoding = encoding
+
             specs[name] = _geoparquet_column_spec_from_type(
-                type, add_geometry_types=add_geometry_types, encoding=encoding
+                type, add_geometry_types=add_geometry_types, encoding=column_encoding
             )
 
     return specs
@@ -376,7 +714,7 @@ def _geoparquet_metadata_from_schema(
     encoding=None,
 ):
     primary_geometry_column = _geoparquet_guess_primary_geometry_column(
-        schema, primary_geometry_column
+        schema, primary_geometry_column, geometry_columns=geometry_columns
     )
     columns = _geoparquet_columns_from_schema(
         schema,
@@ -520,6 +858,8 @@ _GEOARROW_ENCODINGS = {
     "multilinestring": _type.multilinestring(),
     "multipolygon": _type.multipolygon(),
 }
+
+_PLAN_ENCODINGS = frozenset(("WKB",) + tuple(_GEOARROW_ENCODINGS))
 
 _CRS_LONLAT = {
     "$schema": "https://proj.org/schemas/v0.7/projjson.schema.json",

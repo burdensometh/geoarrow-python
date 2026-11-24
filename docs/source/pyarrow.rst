@@ -110,6 +110,14 @@ IO helpers
 
     .. autofunction:: write_geoparquet_table
 
+    .. autofunction:: plan_geometry_encoding
+
+    .. autoclass:: GeometryEncodingPlan
+        :members:
+
+    .. autoclass:: ColumnEncodingPlan
+        :members:
+
 
 Dataset constructors
 --------------------

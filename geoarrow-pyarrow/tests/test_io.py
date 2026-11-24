@@ -188,6 +188,22 @@ def test_geoparquet_guess_primary_geometry_column():
         == "first_def_geom"
     )
 
+    # Explicitly declared geometry columns are the fallback primary column
+    assert (
+        io._geoparquet_guess_primary_geometry_column(
+            pa.schema([pa.field("plain_binary", pa.binary())]),
+            geometry_columns=["plain_binary"],
+        )
+        == "plain_binary"
+    )
+
+    # ...unless they don't exist in the schema
+    with pytest.raises(ValueError, match="at least one geometry column"):
+        io._geoparquet_guess_primary_geometry_column(
+            pa.schema([pa.field("not_geom", pa.binary())]),
+            geometry_columns=["also_not_geom"],
+        )
+
 
 def test_geoparquet_columns_from_schema():
     schema = pa.schema([pa.field("col_a", ga.wkb()), pa.field("col_b", pa.binary())])
@@ -396,3 +412,300 @@ def test_table_to_geoarrow():
         tab_no_cols, {"col_name": {"encoding": "WKB"}}
     )
     assert tab_no_cols_geo == tab_no_cols
+
+
+def test_plan_geometry_encoding_native_point():
+    # WKT-encoded points with uniform XY dimensions
+    tab = pa.table({"geometry": ga.array(["POINT (0 1)", None, "POINT (2 3)"])})
+    plan = io.plan_geometry_encoding(tab)
+    assert plan.encodings == {"geometry": "point"}
+    assert plan["geometry"].reason == "all features are Point"
+    assert plan["geometry"].geometry_types == ("Point",)
+    assert plan["geometry"].expected_type == ga.point()
+
+    # WKB-encoded points with Z dimensions
+    tab = pa.table({"geometry": ga.as_wkb(["POINT Z (0 1 2)", None])})
+    plan = io.plan_geometry_encoding(tab)
+    assert plan.encodings == {"geometry": "point"}
+    assert plan["geometry"].reason == "all features are Point Z"
+    assert plan["geometry"].expected_type == ga.point().with_dimensions(
+        ga.Dimensions.XYZ
+    )
+
+    # Already geoarrow-encoded points (XYM)
+    tab = pa.table({"geometry": ga.as_geoarrow(ga.array(["POINT M (0 1 2)"]))})
+    plan = io.plan_geometry_encoding(tab)
+    assert plan.encodings == {"geometry": "point"}
+    assert plan["geometry"].expected_type == ga.point().with_dimensions(
+        ga.Dimensions.XYM
+    )
+
+
+def test_plan_geometry_encoding_wkb_fallback():
+    # Non-point geometry type
+    tab = pa.table({"geometry": ga.array(["LINESTRING (0 0, 1 1)", None])})
+    plan = io.plan_geometry_encoding(tab)
+    assert plan.encodings == {"geometry": "WKB"}
+    assert "cannot be represented with native point encoding" in plan["geometry"].reason
+    assert plan["geometry"].geometry_types == ("LineString",)
+    assert plan["geometry"].expected_type == ga.wkb()
+
+    # Mixed geometry types
+    tab = pa.table({"geometry": ga.array(["POINT (0 1)", "LINESTRING (0 0, 1 1)"])})
+    plan = io.plan_geometry_encoding(tab)
+    assert plan.encodings == {"geometry": "WKB"}
+    assert plan["geometry"].geometry_types == ("LineString", "Point")
+    assert "'LineString', 'Point'" in plan["geometry"].reason
+
+    # Points with mixed dimensions cannot share one native point type
+    tab = pa.table({"geometry": ga.array(["POINT (0 1)", "POINT Z (0 1 2)"])})
+    plan = io.plan_geometry_encoding(tab)
+    assert plan.encodings == {"geometry": "WKB"}
+    assert "mixed dimensions" in plan["geometry"].reason
+    assert plan["geometry"].geometry_types == ("Point", "Point Z")
+
+    # Multi geometries are not the native point representation
+    tab = pa.table({"geometry": ga.array(["MULTIPOINT (0 1, 2 3)"])})
+    plan = io.plan_geometry_encoding(tab)
+    assert plan.encodings == {"geometry": "WKB"}
+    assert plan["geometry"].geometry_types == ("MultiPoint",)
+
+    # No non-null features: native point eligibility cannot be verified
+    tab = pa.table(
+        {"geometry": ga.wkb().wrap_array(pa.array([None, None], pa.binary()))}
+    )
+    plan = io.plan_geometry_encoding(tab)
+    assert plan.encodings == {"geometry": "WKB"}
+    assert "no non-null features" in plan["geometry"].reason
+    assert plan["geometry"].geometry_types == ()
+
+
+def test_plan_geometry_encoding_explicit_columns():
+    wkb_point_0_1 = bytes.fromhex("01010000000000000000000000000000000000F03F")
+    tab = pa.table(
+        {"wkb_col": pa.array([wkb_point_0_1, None]), "value": pa.array([1, 2])}
+    )
+
+    # No extension-typed columns: nothing is planned by default
+    plan = io.plan_geometry_encoding(tab)
+    assert plan.column_names == ()
+
+    # Plain binary columns can be planned explicitly
+    plan = io.plan_geometry_encoding(tab, geometry_columns=["wkb_col"])
+    assert plan.encodings == {"wkb_col": "point"}
+    # A column without GeoArrow metadata gets the GeoParquet default CRS on read
+    assert plan["wkb_col"].expected_type.crs == types.OGC_CRS84
+
+    with pytest.raises(ValueError, match="not present in the table"):
+        io.plan_geometry_encoding(tab, geometry_columns=["this_column_does_not_exist"])
+
+
+def test_write_geoparquet_table_with_plan_plain_columns():
+    wkb_point_0_1 = bytes.fromhex("01010000000000000000000000000000000000F03F")
+    tab = pa.table(
+        {"wkb_col": pa.array([wkb_point_0_1, None]), "value": pa.array([1, 2])}
+    )
+    plan = io.plan_geometry_encoding(tab, geometry_columns=["wkb_col"])
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        temp_pq = os.path.join(tmpdir, "test.parquet")
+
+        # The plan alone declares the geometry columns of the export
+        io.write_geoparquet_table(tab, temp_pq, geometry_encoding=plan)
+        geo_meta = json.loads(parquet.read_table(temp_pq).schema.metadata[b"geo"])
+        assert geo_meta["primary_column"] == "wkb_col"
+        assert geo_meta["columns"]["wkb_col"]["encoding"] == "point"
+
+        # ...and explicit geometry_columns that match the plan are also fine
+        temp_pq2 = os.path.join(tmpdir, "test2.parquet")
+        io.write_geoparquet_table(
+            tab, temp_pq2, geometry_columns=["wkb_col"], geometry_encoding=plan
+        )
+
+        for path in (temp_pq, temp_pq2):
+            tab2 = io.read_geoparquet_table(path)
+            assert tab2["wkb_col"].type == plan["wkb_col"].expected_type
+            assert tab2["wkb_col"].type.crs == types.OGC_CRS84
+            assert tab2["wkb_col"].is_null().to_pylist() == [False, True]
+            assert ga.format_wkt(tab2["wkb_col"]).to_pylist() == ["POINT (0 1)", None]
+            assert tab2["value"].to_pylist() == [1, 2]
+
+
+def test_plan_geometry_encoding_crs_and_edges():
+    tab = pa.table(
+        {
+            "with_crs": ga.with_crs(ga.array(["POINT (0 1)"]), types.OGC_CRS84),
+            "spherical": ga.with_edge_type(
+                ga.array(["LINESTRING (0 0, 1 1)"]), ga.EdgeType.SPHERICAL
+            ),
+        }
+    )
+    plan = io.plan_geometry_encoding(tab)
+    assert plan["with_crs"].expected_type.crs == types.OGC_CRS84
+    assert plan["spherical"].expected_type.edge_type == ga.EdgeType.SPHERICAL
+
+
+def test_geometry_encoding_plan_object():
+    plan = io.GeometryEncodingPlan(
+        {
+            "a": io.ColumnEncodingPlan("point", "all features are Point"),
+            "b": io.ColumnEncodingPlan("WKB", "fallback"),
+        }
+    )
+
+    assert plan.column_names == ("a", "b")
+    assert plan.encodings == {"a": "point", "b": "WKB"}
+    assert plan["a"].encoding == "point"
+    assert "a" in plan and "c" not in plan
+    assert len(plan) == 2
+    assert plan.encoding_for("b") == "WKB"
+
+    with pytest.raises(ValueError, match="not covered by this encoding plan"):
+        plan.encoding_for("c")
+
+    assert plan == io.GeometryEncodingPlan(
+        {
+            "a": io.ColumnEncodingPlan("point", "all features are Point"),
+            "b": io.ColumnEncodingPlan("WKB", "fallback"),
+        }
+    )
+    assert plan != io.GeometryEncodingPlan(
+        {"a": io.ColumnEncodingPlan("point", "all features are Point")}
+    )
+
+    plan_repr = repr(plan)
+    assert "a: point (all features are Point)" in plan_repr
+    assert "b: WKB (fallback)" in plan_repr
+    assert repr(io.GeometryEncodingPlan({})) == "GeometryEncodingPlan()"
+
+    # Column plans carry defaults so that hand-built plans are cheap to write
+    assert io.ColumnEncodingPlan("WKB") == ("WKB", "", (), None)
+
+    with pytest.raises(ValueError, match="Invalid encoding"):
+        io.GeometryEncodingPlan({"geometry": io.ColumnEncodingPlan("NotAnEncoding")})
+
+    with pytest.raises(TypeError, match="not a ColumnEncodingPlan"):
+        io.GeometryEncodingPlan({"geometry": "point"})
+
+
+def test_write_geoparquet_table_with_plan():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        temp_pq = os.path.join(tmpdir, "test.parquet")
+        tab = pa.table(
+            {
+                "id": pa.array([1, 2, 3]),
+                "pt": ga.with_crs(
+                    ga.array(["POINT (0 1)", None, "POINT (2 3)"]), types.OGC_CRS84
+                ),
+                "pt_z": ga.as_wkb(["POINT Z (0 1 2)", "POINT Z (3 4 5)", None]),
+                "lines": ga.array(
+                    [
+                        "LINESTRING (0 0, 1 1)",
+                        "LINESTRING (2 2, 3 3)",
+                        "LINESTRING (4 4, 5 5)",
+                    ]
+                ),
+                "mixed": ga.array(["POINT (0 1)", "LINESTRING (0 0, 1 1)", None]),
+            }
+        )
+
+        plan = io.plan_geometry_encoding(tab)
+        assert plan.encodings == {
+            "pt": "point",
+            "pt_z": "point",
+            "lines": "WKB",
+            "mixed": "WKB",
+        }
+
+        io.write_geoparquet_table(tab, temp_pq, geometry_encoding=plan)
+
+        # The file metadata declares exactly the planned encodings
+        tab_meta = parquet.read_table(temp_pq)
+        geo_meta = json.loads(tab_meta.schema.metadata[b"geo"])
+        assert geo_meta["version"] == "1.1.0"
+        file_encodings = {
+            name: col["encoding"] for name, col in geo_meta["columns"].items()
+        }
+        assert file_encodings == plan.encodings
+
+        # Read back and verify type identity, CRS, nulls, and values per column
+        tab2 = io.read_geoparquet_table(temp_pq)
+        for name in plan:
+            expected_type = plan[name].expected_type
+            assert tab2[name].type == expected_type
+            assert tab2[name].type.crs == expected_type.crs
+            assert tab2[name].is_null().to_pylist() == tab[name].is_null().to_pylist()
+            assert (
+                ga.format_wkt(tab2[name]).to_pylist()
+                == ga.format_wkt(tab[name]).to_pylist()
+            )
+
+        # CRS values survive the round trip per column
+        assert tab2["pt"].type.crs == types.OGC_CRS84
+        assert tab2["pt_z"].type.crs is None
+
+        # Native-encoded columns read back as native point; fallback as WKB
+        assert isinstance(tab2["pt"].type, ga.PointType)
+        assert tab2["pt_z"].type == ga.point().with_dimensions(ga.Dimensions.XYZ)
+        assert isinstance(tab2["lines"].type, ga.WkbType)
+        assert isinstance(tab2["mixed"].type, ga.WkbType)
+
+        # Non-geometry columns are untouched
+        assert tab2["id"].to_pylist() == [1, 2, 3]
+
+
+def test_write_geoparquet_table_plan_errors():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        temp_pq = os.path.join(tmpdir, "test.parquet")
+        tab = pa.table(
+            {
+                "pt": ga.array(["POINT (0 1)"]),
+                "lines": ga.array(["LINESTRING (0 0, 1 1)"]),
+            }
+        )
+
+        # The plan may not contain columns that are not in the table
+        plan = io.GeometryEncodingPlan(
+            {
+                "pt": io.ColumnEncodingPlan("point"),
+                "not_a_column": io.ColumnEncodingPlan("WKB"),
+            }
+        )
+        with pytest.raises(ValueError, match="not present in the table"):
+            io.write_geoparquet_table(tab, temp_pq, geometry_encoding=plan)
+
+        # The plan must cover every detected geometry column
+        plan = io.GeometryEncodingPlan({"pt": io.ColumnEncodingPlan("point")})
+        with pytest.raises(ValueError, match="not covered by this encoding plan"):
+            io.write_geoparquet_table(tab, temp_pq, geometry_encoding=plan)
+
+        # ...including columns passed explicitly via geometry_columns
+        with pytest.raises(ValueError, match="not covered by this encoding plan"):
+            io.write_geoparquet_table(
+                tab,
+                temp_pq,
+                geometry_columns=["pt", "lines"],
+                geometry_encoding=plan,
+            )
+
+
+def test_write_geoparquet_table_hand_built_plan():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        temp_pq = os.path.join(tmpdir, "test.parquet")
+        tab = pa.table({"geometry": ga.array(["POINT (0 1)", "POINT (2 3)"])})
+
+        # Force WKB even though the column is eligible for native point
+        plan = io.GeometryEncodingPlan(
+            {"geometry": io.ColumnEncodingPlan("WKB", reason="forced")}
+        )
+        io.write_geoparquet_table(tab, temp_pq, geometry_encoding=plan)
+        geo_meta = json.loads(parquet.read_table(temp_pq).schema.metadata[b"geo"])
+        assert geo_meta["version"] == "1.0.0"
+        assert geo_meta["columns"]["geometry"]["encoding"] == "WKB"
+
+        tab2 = io.read_geoparquet_table(temp_pq)
+        assert isinstance(tab2["geometry"].type, ga.WkbType)
+        assert ga.format_wkt(tab2["geometry"]).to_pylist() == [
+            "POINT (0 1)",
+            "POINT (2 3)",
+        ]
