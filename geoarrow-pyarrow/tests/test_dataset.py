@@ -91,6 +91,151 @@ def test_geodataset_multiple_geometry_columns():
     assert filtered2.num_rows == 1
 
 
+def make_roads_dataset(**kwargs):
+    # A table with start point, end point, and corridor columns
+    table1 = pa.table(
+        [
+            ga.array(["POINT (0.5 1.5)"]),
+            ga.array(["POINT (10.5 11.5)"]),
+            ga.array(["LINESTRING (0.5 1.5, 10.5 11.5)"]),
+        ],
+        ["start", "end", "corridor"],
+    )
+    table2 = pa.table(
+        [
+            ga.array(["POINT (2.5 3.5)"]),
+            ga.array(["POINT (12.5 13.5)"]),
+            ga.array(["LINESTRING (2.5 3.5, 12.5 13.5)"]),
+        ],
+        ["start", "end", "corridor"],
+    )
+    return gads.dataset([table1, table2], **kwargs)
+
+
+def test_geodataset_index_fragments_columns():
+    geods = make_roads_dataset()
+
+    # Index a single column: only that column is read and returned
+    index_end = geods.index_fragments(columns=["end"])
+    assert index_end.column_names == ["_fragment_index", "end"]
+    assert index_end.column("end").to_pylist() == [
+        {"xmin": 10.5, "ymin": 11.5, "xmax": 10.5, "ymax": 11.5},
+        {"xmin": 12.5, "ymin": 13.5, "xmax": 12.5, "ymax": 13.5},
+    ]
+
+    # A later request for more columns reuses the cached column and
+    # returns columns in the requested order
+    index_all = geods.index_fragments()
+    assert index_all.column_names == ["_fragment_index", "start", "end", "corridor"]
+    assert index_all.column("end") == index_end.column("end")
+
+    # A single column name can be passed as a string
+    index_start = geods.index_fragments(columns="start")
+    assert index_start.column_names == ["_fragment_index", "start"]
+
+
+def test_geodataset_index_fragments_columns_errors():
+    geods = make_roads_dataset()
+
+    with pytest.raises(ValueError, match="does not exist in the dataset schema"):
+        geods.index_fragments(columns=["not_a_column"])
+
+    with pytest.raises(ValueError, match="is not a geometry column"):
+        table = pa.table(
+            [ga.array(["POINT (0.5 1.5)"]), pa.array([1])], ["geometry", "not_geo"]
+        )
+        geods = gads.dataset(table)
+        geods.index_fragments(columns=["not_geo"])
+
+
+def test_geodataset_filter_fragments_columns():
+    geods = make_roads_dataset()
+
+    # Window intersects the "end" of fragment 2 only, but intersects
+    # the "corridor" of both fragments
+    window = "POLYGON ((12 13, 13 13, 13 14, 12 14, 12 13))"
+    filtered = geods.filter_fragments(window, columns=["end"])
+    assert filtered.to_table().num_rows == 1
+    assert filtered.to_table().column("end").to_pylist() == ["POINT (12.5 13.5)"]
+
+    # Only the requested column should have been indexed (i.e., read)
+    assert geods._index.column_names == ["_fragment_index", "end"]
+    assert filtered._index.column_names == ["_fragment_index", "end"]
+
+    # Filtering the wrapped dataset on another column only reads that column
+    filtered2 = filtered.filter_fragments(
+        "POLYGON ((0 1, 1 1, 1 2, 0 2, 0 1))", columns=["start"]
+    )
+    assert filtered2.to_table().num_rows == 0
+    assert filtered._index.column_names == ["_fragment_index", "end", "start"]
+
+
+def test_geodataset_filter_fragments_multi_column_conditions():
+    geods = make_roads_dataset()
+    window_end = "POLYGON ((12 13, 13 13, 13 14, 12 14, 12 13))"
+    window_corridor = "POLYGON ((0 1, 1 1, 1 2, 0 2, 0 1))"
+
+    # "or": candidates matching any condition are merged
+    filtered_or = geods.filter_fragments(
+        {"end": window_end, "corridor": window_corridor}, mode="or"
+    )
+    assert filtered_or.to_table().num_rows == 2
+
+    # "and": only candidates matching every condition are kept
+    filtered_and = geods.filter_fragments(
+        {"end": window_end, "corridor": window_corridor}, mode="and"
+    )
+    assert filtered_and.to_table().num_rows == 0
+
+    # The same window applied to multiple columns with mode="and"
+    filtered_and2 = geods.filter_fragments(
+        "POLYGON ((2 3, 13 3, 13 14, 2 14, 2 3))",
+        columns=["start", "end"],
+        mode="and",
+    )
+    assert filtered_and2.to_table().num_rows == 1
+
+
+def test_geodataset_filter_fragments_errors():
+    geods = make_roads_dataset()
+    window = "POLYGON ((12 13, 13 13, 13 14, 12 14, 12 13))"
+
+    with pytest.raises(ValueError, match="does not exist in the dataset schema"):
+        geods.filter_fragments(window, columns=["not_a_column"])
+
+    with pytest.raises(ValueError, match="Invalid mode"):
+        geods.filter_fragments(window, columns=["end"], mode="invalid")
+
+    with pytest.raises(ValueError, match="columns cannot be specified"):
+        geods.filter_fragments({"end": window}, columns=["end"])
+
+    with pytest.raises(ValueError, match="no geometry columns"):
+        geods.filter_fragments(window, columns=[])
+
+    with pytest.raises(ValueError, match="no geometry columns"):
+        geods.filter_fragments({})
+
+
+def test_geodataset_filter_fragments_columns_avoids_other_columns():
+    # The corridor column contains invalid WKT: filtering on "end" must
+    # not read it, but filtering on "corridor" must fail
+    table = pa.table(
+        [ga.array(["POINT (10.5 11.5)"]), pa.array(["NOT VALID WKT"])],
+        ["end", "corridor"],
+    )
+    geods = gads.dataset(table, geometry_columns=["end", "corridor"])
+
+    filtered = geods.filter_fragments(
+        "POLYGON ((10 11, 11 11, 11 12, 10 12, 10 11))", columns=["end"]
+    )
+    assert filtered.to_table().num_rows == 1
+
+    with pytest.raises(Exception):
+        geods.filter_fragments(
+            "POLYGON ((10 11, 11 11, 11 12, 10 12, 10 11))", columns=["corridor"]
+        )
+
+
 def test_geodataset_parquet():
     table1 = pa.table([ga.array(["POINT (0.5 1.5)"])], ["geometry"])
     table2 = pa.table([ga.array(["POINT (2.5 3.5)"])], ["geometry"])
@@ -194,6 +339,125 @@ def test_geodataset_parquet_filter_rowgroups_with_stats():
             "POLYGON ((0 1, 1 1, 1 2, 0 2, 0 1))"
         ).to_table()
         assert filtered1.num_rows == 1
+
+
+def make_roads_table():
+    return pa.table(
+        [
+            ga.as_geoarrow(["POINT (0.5 1.5)", "POINT (2.5 3.5)"]),
+            ga.as_geoarrow(["POINT (10.5 11.5)", "POINT (12.5 13.5)"]),
+            ga.as_geoarrow(
+                [
+                    "LINESTRING (0.5 1.5, 10.5 11.5)",
+                    "LINESTRING (2.5 3.5, 12.5 13.5)",
+                ]
+            ),
+        ],
+        ["start", "end", "corridor"],
+    )
+
+
+def test_geodataset_parquet_rowgroups_multiple_stats_columns():
+    # Multiple columns whose boxes can be built from column statistics
+    table = make_roads_table()
+    with TemporaryDirectory() as td:
+        pq.write_table(table, f"{td}/table.parquet", row_group_size=1)
+
+        geods = gads.dataset(f"{td}/table.parquet")
+        index = geods.index_fragments()
+        assert index.column_names == ["_fragment_index", "start", "end", "corridor"]
+        assert index.column("end").to_pylist() == [
+            {"xmin": 10.5, "ymin": 11.5, "xmax": 10.5, "ymax": 11.5},
+            {"xmin": 12.5, "ymin": 13.5, "xmax": 12.5, "ymax": 13.5},
+        ]
+        assert index.column("corridor").to_pylist() == [
+            {"xmin": 0.5, "ymin": 1.5, "xmax": 10.5, "ymax": 11.5},
+            {"xmin": 2.5, "ymin": 3.5, "xmax": 12.5, "ymax": 13.5},
+        ]
+
+        # Filtering on one column only builds the index for that column
+        geods = gads.dataset(f"{td}/table.parquet")
+        filtered = geods.filter_fragments(
+            "POLYGON ((12 13, 13 13, 13 14, 12 14, 12 13))", columns=["end"]
+        )
+        assert filtered.to_table().num_rows == 1
+        assert geods._index.column_names == ["_fragment_index", "end"]
+
+        # Multi-column conditions with mode="and"
+        geods = gads.dataset(f"{td}/table.parquet")
+        filtered_and = geods.filter_fragments(
+            {
+                "end": "POLYGON ((12 13, 13 13, 13 14, 12 14, 12 13))",
+                "corridor": "POLYGON ((0 1, 1 1, 1 2, 0 2, 0 1))",
+            },
+            mode="and",
+        )
+        assert filtered_and.to_table().num_rows == 0
+
+
+def test_geodataset_parquet_rowgroups_missing_stats():
+    # When statistics are missing for the requested column, the index
+    # falls back to computing exact boxes from the data (and only reads
+    # that column)
+    table = make_roads_table()
+    with TemporaryDirectory() as td:
+        pq.write_table(
+            table,
+            f"{td}/table.parquet",
+            row_group_size=1,
+            write_statistics=["start", "corridor"],
+        )
+
+        geods = gads.dataset(f"{td}/table.parquet")
+        filtered = geods.filter_fragments(
+            "POLYGON ((12 13, 13 13, 13 14, 12 14, 12 13))", columns=["end"]
+        )
+        assert filtered.to_table().num_rows == 1
+        assert filtered.to_table().column("end").to_pylist() == [{"x": 12.5, "y": 13.5}]
+
+
+def test_geodataset_parquet_rowgroups_partial_stats_coverage():
+    # Statistics cover some but not all files: the result must still be
+    # exact (uncertain coverage falls back to reading the data)
+    table1 = pa.table(
+        [ga.as_geoarrow(["POINT (10.5 11.5)"])], ["end"]
+    )
+    table2 = pa.table(
+        [ga.as_geoarrow(["POINT (12.5 13.5)"])], ["end"]
+    )
+    with TemporaryDirectory() as td:
+        pq.write_table(table1, f"{td}/table1.parquet", write_statistics=True)
+        pq.write_table(table2, f"{td}/table2.parquet", write_statistics=False)
+
+        geods = gads.dataset([f"{td}/table1.parquet", f"{td}/table2.parquet"])
+        assert len(geods.get_fragments()) == 2
+
+        index = geods.index_fragments(columns=["end"])
+        assert index.column("end").to_pylist() == [
+            {"xmin": 10.5, "ymin": 11.5, "xmax": 10.5, "ymax": 11.5},
+            {"xmin": 12.5, "ymin": 13.5, "xmax": 12.5, "ymax": 13.5},
+        ]
+
+        filtered = geods.filter_fragments(
+            "POLYGON ((12 13, 13 13, 13 14, 12 14, 12 13))", columns=["end"]
+        )
+        assert filtered.to_table().num_rows == 1
+
+
+def test_geodataset_parquet_rowgroups_stats_multiple_files():
+    # Each file's statistics must be read from its own metadata
+    table1 = pa.table([ga.as_geoarrow(["POINT (10.5 11.5)"])], ["end"])
+    table2 = pa.table([ga.as_geoarrow(["POINT (12.5 13.5)"])], ["end"])
+    with TemporaryDirectory() as td:
+        pq.write_table(table1, f"{td}/table1.parquet")
+        pq.write_table(table2, f"{td}/table2.parquet")
+
+        geods = gads.dataset([f"{td}/table1.parquet", f"{td}/table2.parquet"])
+        index = geods.index_fragments(columns=["end"])
+        assert index.column("end").to_pylist() == [
+            {"xmin": 10.5, "ymin": 11.5, "xmax": 10.5, "ymax": 11.5},
+            {"xmin": 12.5, "ymin": 13.5, "xmax": 12.5, "ymax": 13.5},
+        ]
 
 
 def test_parquet_fields_before():

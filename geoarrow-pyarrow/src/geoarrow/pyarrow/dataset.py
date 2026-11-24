@@ -144,7 +144,7 @@ class GeoDataset:
 
         return self._geometry_types
 
-    def index_fragments(self, num_threads=None):
+    def index_fragments(self, columns=None, num_threads=None):
         """Resolve a simplified geometry for each fragment
 
         Currently the simplified geometry is a box in the form of a
@@ -154,6 +154,10 @@ class GeoDataset:
         name. A future implementation may handle spherical edges using a type
         of simplified geometry more suitable to a spherical comparison.
 
+        If `columns` is specified, only those geometry columns are indexed:
+        other geometry columns are neither indexed nor read. Columns that
+        have already been indexed are cached and are not indexed again.
+
         >>> import geoarrow.pyarrow.dataset as gads
         >>> import geoarrow.pyarrow as ga
         >>> import pyarrow as pa
@@ -162,12 +166,52 @@ class GeoDataset:
         >>> dataset.index_fragments().to_pylist()
         [{'_fragment_index': 0, 'geometry': {'xmin': 0.5, 'ymin': 1.5, 'xmax': 0.5, 'ymax': 1.5}}]
         """
-        if self._index is None:
-            self._index = self._build_index(
-                self.geometry_columns, self.geometry_types, num_threads
-            )
+        columns = self._resolve_index_columns(columns)
 
-        return self._index
+        built_columns = [] if self._index is None else self._index.column_names[1:]
+        missing = [col for col in columns if col not in built_columns]
+        if self._index is None or missing:
+            new_index = self._build_index(
+                missing, self._geometry_types_for(missing), num_threads
+            )
+            if self._index is None:
+                self._index = new_index
+            else:
+                for col in missing:
+                    self._index = self._index.append_column(col, new_index.column(col))
+
+        return self._index.select(["_fragment_index"] + list(columns))
+
+    def _resolve_index_columns(self, columns):
+        """Validate a requested column selection against the dataset schema"""
+        if columns is None:
+            return list(self.geometry_columns)
+
+        if isinstance(columns, str):
+            columns = [columns]
+
+        # Deduplicate, preserving order
+        columns = list(dict.fromkeys(columns))
+
+        schema_names = self.schema.names
+        for col in columns:
+            if col not in schema_names:
+                raise ValueError(
+                    f"Column '{col}' does not exist in the dataset schema "
+                    f"(available columns: {schema_names})"
+                )
+            elif col not in self.geometry_columns:
+                raise ValueError(
+                    f"Column '{col}' is not a geometry column of this dataset "
+                    f"(geometry columns: {list(self.geometry_columns)})"
+                )
+
+        return columns
+
+    def _geometry_types_for(self, columns):
+        """Resolve geometry types for a subset of geometry columns"""
+        types_by_name = dict(zip(self.geometry_columns, self.geometry_types))
+        return tuple(types_by_name[col] for col in columns)
 
     def _build_index(self, geometry_columns, geometry_types, num_threads=None):
         return GeoDataset._index_fragments(
@@ -177,17 +221,27 @@ class GeoDataset:
             num_threads=num_threads,
         )
 
-    def filter_fragments(self, target):
+    def filter_fragments(self, target, columns=None, mode="or"):
         """Push down a spatial query into a GeoDataset
 
         Returns a potentially simplified dataset based on the geometry of
-        target. Currently this uses `geoarrow.pyarrow.box_agg()` on `target`
-        and performs a simple envelope comparison with each fragment. A future
-        implementation may handle spherical edges using a type of simplified
-        geometry more suitable to a spherical comparison. For datasets with
-        more than one geometry column, the filter will be applied to all columns
-        and include fragments that intersect the simplified geometry from any
-        of the columns.
+        `target`. Currently this uses `geoarrow.pyarrow.box_agg()` on each
+        target and performs a simple envelope comparison with each fragment.
+        A future implementation may handle spherical edges using a type of
+        simplified geometry more suitable to a spherical comparison.
+
+        The `columns` argument selects the geometry column(s) used to build
+        the fragment index and evaluate the query: only those columns are
+        indexed and read. If `columns` is `None`, all geometry columns are
+        used. Alternatively, `target` may be a dict mapping geometry column
+        names to targets to apply a different query to each column (in which
+        case `columns` must not be specified).
+
+        For queries that involve more than one column, `mode` selects how
+        candidate fragments are merged: `"or"` (the default) includes
+        fragments that intersect the simplified geometry of any column;
+        `"and"` includes only fragments that intersect the simplified
+        geometry of every column.
 
         Note that datasets with large row groups/fragments and/or datasets that
         were not written with fragments with spatial significance may return
@@ -208,18 +262,78 @@ class GeoDataset:
         geometry: extension<geoarrow.wkt<WktType>>
         ----
         geometry: [["POINT (0.5 1.5)"]]
+
+        Use `columns` to restrict the query to a single geometry column:
+
+        >>> table = pa.table(
+        ...     [ga.array(["POINT (0.5 1.5)"]), ga.array(["POINT (10.5 11.5)"])],
+        ...     ["geometry1", "geometry2"],
+        ... )
+        >>> dataset = gads.dataset(table)
+        >>> dataset.filter_fragments(
+        ...     "POLYGON ((0 1, 0 2, 1 2, 1 1, 0 1))", columns=["geometry2"]
+        ... ).to_table()
+        pyarrow.Table
+        geometry1: extension<geoarrow.wkt<WktType>>
+        geometry2: extension<geoarrow.wkt<WktType>>
+        ----
+        geometry1: []
+        geometry2: []
+
+        Use a dict target to apply a different query to each column:
+
+        >>> dataset.filter_fragments(
+        ...     {
+        ...         "geometry1": "POLYGON ((0 1, 0 2, 1 2, 1 1, 0 1))",
+        ...         "geometry2": "POLYGON ((10 11, 10 12, 11 12, 11 11, 10 11))",
+        ...     },
+        ...     mode="and",
+        ... ).to_table()
+        pyarrow.Table
+        geometry1: extension<geoarrow.wkt<WktType>>
+        geometry2: extension<geoarrow.wkt<WktType>>
+        ----
+        geometry1: [["POINT (0.5 1.5)"]]
+        geometry2: [["POINT (10.5 11.5)"]]
         """
         from ._compute import box_agg
 
-        if isinstance(target, str):
-            target = [target]
-        target_box = box_agg(target).as_py()
-        maybe_intersects = GeoDataset._index_box_intersects(
-            self.index_fragments(), target_box, self.geometry_columns
-        )
+        targets = self._resolve_filter_targets(target, columns)
+        if mode not in ("or", "and"):
+            raise ValueError(f"Invalid mode '{mode}': must be 'or' or 'and'")
+
+        index = self.index_fragments(columns=list(targets.keys()))
+        boxes = {}
+        for col, col_target in targets.items():
+            if isinstance(col_target, str):
+                col_target = [col_target]
+            boxes[col] = box_agg(col_target).as_py()
+
+        maybe_intersects = GeoDataset._index_box_intersects(index, boxes, mode)
         fragment_indices = [scalar.as_py() for scalar in maybe_intersects]
         filtered_parent = self._filter_parent_fragment_indices(fragment_indices)
         return self._wrap_parent(filtered_parent, fragment_indices)
+
+    def _resolve_filter_targets(self, target, columns):
+        """Normalize a filter target into a dict of column name to target"""
+        if isinstance(target, dict):
+            if columns is not None:
+                raise ValueError(
+                    "columns cannot be specified when target is a dict "
+                    "(the dict keys already specify the columns)"
+                )
+            targets = dict(target)
+            # Validate column names before building any index
+            self._resolve_index_columns(list(targets.keys()))
+        else:
+            targets = {col: target for col in self._resolve_index_columns(columns)}
+
+        if not targets:
+            raise ValueError(
+                "Can't filter fragments: no geometry columns were specified"
+            )
+
+        return targets
 
     def _wrap_parent(self, filtered_parent, fragment_indices):
         new_wrapped = GeoDataset(
@@ -227,12 +341,16 @@ class GeoDataset:
         )
         new_wrapped._geometry_types = self.geometry_types
 
-        new_index = self.index_fragments().take(
-            _pa.array(fragment_indices, type=_pa.int64())
-        )
-        new_wrapped._index = new_index.set_column(
-            0, "_fragment_index", _pa.array(range(new_index.num_rows))
-        )
+        # Carry over the columns of the fragment index that have already
+        # been built (without building any that have not, since that may
+        # involve reading geometry columns that are not needed).
+        if self._index is not None:
+            new_index = self._index.take(
+                _pa.array(fragment_indices, type=_pa.int64())
+            )
+            new_wrapped._index = new_index.set_column(
+                0, "_fragment_index", _pa.array(range(new_index.num_rows))
+            )
 
         return new_wrapped
 
@@ -294,21 +412,23 @@ class GeoDataset:
             )
 
     @staticmethod
-    def _index_box_intersects(index, box, columns):
-        xmin, ymin, xmax, ymax = box.values()
+    def _index_box_intersects(index, boxes, mode="or"):
         expressions = []
-        for col in columns:
+        for col, box in boxes.items():
             expr = (
-                (_compute.field(col, "xmin") <= xmax)
-                & (_compute.field(col, "xmax") >= xmin)
-                & (_compute.field(col, "ymin") <= ymax)
-                & (_compute.field(col, "ymax") >= ymin)
+                (_compute.field(col, "xmin") <= box["xmax"])
+                & (_compute.field(col, "xmax") >= box["xmin"])
+                & (_compute.field(col, "ymin") <= box["ymax"])
+                & (_compute.field(col, "ymax") >= box["ymin"])
             )
             expressions.append(expr)
 
         expr = expressions[0]
         for i in range(1, len(expressions)):
-            expr = expr | expressions[i]
+            if mode == "and":
+                expr = expr & expressions[i]
+            else:
+                expr = expr | expressions[i]
 
         result = _ds.dataset(index).filter(expr).to_table()
         return result.column(0)
@@ -385,7 +505,7 @@ class ParquetRowGroupGeoDataset(GeoDataset):
 
     def _build_index(self, geometry_columns, geometry_types, num_threads=None):
         can_use_statistics = [
-            type.coord_type == CoordType.SEPARATED for type in self.geometry_types
+            type.coord_type == CoordType.SEPARATED for type in geometry_types
         ]
 
         if not self._use_column_statistics or not any(can_use_statistics):
@@ -399,17 +519,25 @@ class ParquetRowGroupGeoDataset(GeoDataset):
 
         # Compute the column stats
         bbox_stats = self._build_index_using_stats(bbox_stats_cols)
-        normal_stats_cols = list(geometry_columns)
         stats_by_name = {}
         for col, stat in zip(bbox_stats_cols, bbox_stats):
-            # stat will contain nulls if any statistics were missing:
+            # stat will contain nulls if any statistics were missing. In
+            # that case the statistics don't certainly cover every fragment,
+            # so we fall back to computing exact boxes from the data (reading
+            # only that column) rather than risk a silently incomplete result.
             if stat.null_count == 0:
                 stats_by_name[col] = stat
-                normal_stats_cols.remove(col)
 
         # Compute any remaining statistics
+        normal_stats_cols = []
+        normal_stats_types = []
+        for col, type in zip(geometry_columns, geometry_types):
+            if col not in stats_by_name:
+                normal_stats_cols.append(col)
+                normal_stats_types.append(type)
+
         normal_stats = super()._build_index(
-            normal_stats_cols, geometry_types, num_threads
+            normal_stats_cols, normal_stats_types, num_threads
         )
         for col in normal_stats_cols:
             stats_by_name[col] = normal_stats.column(col)
@@ -432,16 +560,17 @@ class ParquetRowGroupGeoDataset(GeoDataset):
         return self._parquet_field_boxes(parquet_fields_before)
 
     def _parquet_field_boxes(self, parquet_indices):
-        boxes = [[]] * len(parquet_indices)
+        boxes = [[] for _ in parquet_indices]
         pq_file = None
-        last_row_group = None
+        last_path = None
 
         # Note: probably worth parallelizing by file
         for row_group, fragment in zip(self._row_group_ids, self.get_fragments()):
-            if pq_file is None or row_group < last_row_group:
+            if pq_file is None or fragment.path != last_path:
                 pq_file = _pq.ParquetFile(
                     fragment.path, filesystem=self._parent.filesystem
                 )
+                last_path = fragment.path
 
             metadata = pq_file.metadata.row_group(row_group)
             for i, parquet_index in enumerate(parquet_indices):
@@ -459,8 +588,6 @@ class ParquetRowGroupGeoDataset(GeoDataset):
                             "ymax": stats_y.max,
                         }
                     )
-
-            last_row_group = row_group
 
         type_field_names = ["xmin", "ymin", "xmax", "ymax"]
         type_fields = [
