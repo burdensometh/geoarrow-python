@@ -87,7 +87,7 @@ def read_pyogrio_table(*args, **kwargs):
     return table.set_column(geometry_index, geometry_name_out, geometry)
 
 
-def read_geoparquet_table(*args, **kwargs):
+def read_geoparquet_table(*args, primary_geometry_column=None, **kwargs):
     """Read GeoParquet using PyArrow
 
     A thin wrapper around ``pyarrow.parquet.read_parquet()`` that ensures any columns
@@ -100,10 +100,23 @@ def read_geoparquet_table(*args, **kwargs):
     contain well-known binary and a ``geometry`` column encoded as text is assumed to
     contain well-known text.
 
-    Because a ``pyarrow.Table`` has no concept of "primary geometry column", that
-    information is currently lost on read. To minimize the chances of misinterpreting
-    the primary geometry column, use ``geometry`` as the name of the column or
-    refer to columns explicitly.
+    A ``pyarrow.Table`` has no built-in concept of a "primary geometry column";
+    however, this function records the role that each geometry column had when it
+    was written. The primary geometry column is marked using the field metadata key
+    ``b"geoarrow:geometry_role"`` (``b"primary"`` or ``b"secondary"``) and the name
+    of the recorded primary column is stored in the schema metadata key
+    ``b"geoarrow:primary_geometry_column"``. This means that
+    :func:`write_geoparquet_table()` can restore the same primary geometry column
+    (and will refuse to guess a new one) even if the table is projected or
+    otherwise transformed in between.
+
+    If a projection excludes the primary geometry column (e.g.,
+    ``columns=["coverage"]``), the presence of the primary is recorded as absent.
+    In this case the returned table has no primary role. Pass
+    ``primary_geometry_column`` to explicitly designate one of the projected
+    geometry columns as the new primary. Otherwise, a subsequent call to
+    :func:`write_geoparquet_table()` will require an explicit
+    ``primary_geometry_column`` rather than silently promoting a different column.
 
     >>> import geoarrow.pyarrow as ga
     >>> from geoarrow.pyarrow import io
@@ -139,7 +152,38 @@ def read_geoparquet_table(*args, **kwargs):
     else:
         columns = _geoparquet_guess_geometry_columns(tab.schema)
 
-    return _geoparquet_table_to_geoarrow(tab, columns)
+    tab = _geoparquet_table_to_geoarrow(tab, columns)
+
+    # Record the primary/secondary role that each geometry column had when it was
+    # written. A projection that removed the primary column still records that
+    # geometry roles exist, but with no primary, so that a later write is forced
+    # to be explicit instead of silently promoting a different column.
+    geometry_columns = [name for name in tab.schema.names if name in columns]
+    if primary_geometry_column is not None and (
+        primary_geometry_column not in geometry_columns
+    ):
+        raise ValueError(
+            f"Requested primary geometry column '{primary_geometry_column}' is not "
+            "a geometry column present in the read result"
+        )
+
+    roles_are_recorded = "columns" in geo_meta
+    if geometry_columns and (roles_are_recorded or primary_geometry_column is not None):
+        recorded_primary = geo_meta.get("primary_column")
+        if primary_geometry_column is None and recorded_primary in geometry_columns:
+            primary_out = recorded_primary
+        else:
+            primary_out = primary_geometry_column
+
+        tab = _geoparquet_with_geometry_roles(tab, geometry_columns, primary_out)
+    elif not geometry_columns and _PRIMARY_GEOMETRY_COLUMN_KEY in non_geo_meta:
+        # A projection that removed every geometry column must not leave a stale
+        # primary pointing at a column that is no longer there.
+        non_geo_meta = dict(non_geo_meta)
+        del non_geo_meta[_PRIMARY_GEOMETRY_COLUMN_KEY]
+        tab = tab.replace_schema_metadata(non_geo_meta)
+
+    return tab
 
 
 def write_geoparquet_table(
@@ -166,8 +210,22 @@ def write_geoparquet_table(
     `write_geometry_types=False`` to force omitting geometry types even when
     this value is type-constant.
 
+    If the input table was produced by :func:`read_geoparquet_table()` (or
+    otherwise carries geometry roles recorded by it), the primary geometry
+    column is restored from that recorded role. In that case a missing primary
+    geometry column is an error: if a projection removed the originally primary
+    column, pass ``primary_geometry_column`` explicitly to designate a new one.
+    This prevents silently promoting an unrelated coordinate column (e.g., a
+    coverage column) to the primary role.
+
     See :func:`read_geoparquet_table()` for examples.
     """
+    primary_geometry_column, primary_is_designated = (
+        _geoparquet_resolve_primary_geometry_column(
+            table.schema, primary_geometry_column
+        )
+    )
+
     geo_meta = _geoparquet_metadata_from_schema(
         table.schema,
         primary_geometry_column=primary_geometry_column,
@@ -175,6 +233,25 @@ def write_geoparquet_table(
         add_geometry_types=write_geometry_types,
         encoding=geometry_encoding,
     )
+
+    # The resolved primary must actually be written as a geometry column. If it
+    # was designated (explicitly or recorded by read_geoparquet_table()), doing
+    # anything else would silently substitute a different column as the center.
+    if primary_geometry_column not in geo_meta["columns"]:
+        if primary_is_designated:
+            raise ValueError(
+                f"Primary geometry column '{primary_geometry_column}' is not among "
+                "the geometry columns being written"
+            )
+
+        if not geo_meta["columns"]:
+            raise ValueError(
+                "write_geoparquet_table() requires source with at least one "
+                "geometry column"
+            )
+
+        primary_geometry_column = sorted(geo_meta["columns"])[0]
+        geo_meta["primary_column"] = primary_geometry_column
 
     # Note: this will also update geo_meta with geometry_types and bbox if requested
     for i, name in enumerate(table.schema.names):
@@ -191,10 +268,159 @@ def write_geoparquet_table(
                 ),
             )
 
+    # Keep the geometry roles in sync with the primary column actually written
+    table = _geoparquet_with_geometry_roles(
+        table,
+        list(geo_meta["columns"].keys()),
+        geo_meta["primary_column"],
+    )
+
     metadata = table.schema.metadata if table.schema.metadata else {}
     metadata["geo"] = json.dumps(geo_meta)
     table = table.replace_schema_metadata(metadata)
     return _pq.write_table(table, *args, **kwargs)
+
+
+def geoparquet_primary_geometry_column(table):
+    """Get the recorded primary geometry column of a table
+
+    Returns the name of the primary geometry column recorded by
+    :func:`read_geoparquet_table()` or ``None`` if no primary role is recorded
+    (including when the primary column was removed by a projection). This is the
+    role that :func:`write_geoparquet_table()` will restore when writing.
+
+    Parameters
+    ----------
+    table : pyarrow.Table or pyarrow.Schema
+        The table (or schema) to query.
+
+    >>> import geoarrow.pyarrow as ga
+    >>> from geoarrow.pyarrow import io
+    >>> import pyarrow as pa
+    >>> tab = pa.table([ga.array(["POINT (0 1)"]), ga.array(["POINT (1 2)"])],
+    ...                names=["center", "coverage"])
+    >>> io.geoparquet_primary_geometry_column(tab) is None
+    True
+    """
+    schema = table if isinstance(table, _pa.Schema) else table.schema
+    _, primary = _geoparquet_get_recorded_primary(schema)
+    return primary
+
+
+def _geoparquet_resolve_primary_geometry_column(schema, primary_geometry_column=None):
+    """Resolve the primary geometry column, also reporting whether it was designated
+
+    Returns a tuple ``(name, is_designated)``. ``is_designated`` is ``True`` if the
+    name came from the caller or from roles recorded by
+    :func:`read_geoparquet_table()` (in which case it must not be replaced by a
+    guess) and ``False`` if it was guessed from the schema.
+    """
+    if primary_geometry_column is not None:
+        if primary_geometry_column not in schema.names:
+            raise ValueError(
+                f"Requested primary geometry column '{primary_geometry_column}' is "
+                "not present in the table"
+            )
+
+        return primary_geometry_column, True
+
+    # Roles recorded by read_geoparquet_table() take precedence over guessing.
+    roles_are_recorded, recorded_primary = _geoparquet_get_recorded_primary(schema)
+    if roles_are_recorded:
+        if recorded_primary is None:
+            raise ValueError(
+                "Can't determine the primary geometry column: the table has "
+                "geometry roles recorded but no primary geometry column (for "
+                "example, because the primary column was removed by a projection). "
+                "Pass primary_geometry_column= to designate one explicitly"
+            )
+
+        if recorded_primary not in schema.names:
+            raise ValueError(
+                f"Recorded primary geometry column '{recorded_primary}' is not "
+                "present in the table. Pass primary_geometry_column= to designate "
+                "one explicitly"
+            )
+
+        return recorded_primary, True
+
+    return _geoparquet_guess_primary_geometry_column(schema), False
+
+
+def _geoparquet_geometry_role(field):
+    if field.metadata is None:
+        return None
+
+    role = field.metadata.get(_GEOMETRY_ROLE_KEY)
+    if role is None:
+        return None
+
+    return role.decode()
+
+
+def _geoparquet_get_recorded_primary(schema):
+    # Roles are recorded in two places so that the information survives common
+    # table transformations: per-field metadata (travels with the column through
+    # select/drop/filter/rename) and schema metadata (also survives
+    # select/drop/filter but is dropped by rename_columns). Field roles are
+    # authoritative because they follow renames; schema metadata is a fallback
+    # for tables whose column-level metadata was stripped.
+    primary_roles = []
+    secondary_roles = []
+    for field in schema:
+        role = _geoparquet_geometry_role(field)
+        if role == _GEOMETRY_ROLE_PRIMARY:
+            primary_roles.append(field.name)
+        elif role == _GEOMETRY_ROLE_SECONDARY:
+            secondary_roles.append(field.name)
+
+    if len(primary_roles) > 1:
+        raise ValueError(
+            "Table has more than one geometry column marked as primary: "
+            + ", ".join(primary_roles)
+        )
+
+    if primary_roles:
+        return True, primary_roles[0]
+
+    if secondary_roles:
+        # Geometry roles were recorded but no column carries the primary role:
+        # the primary column was removed by a projection.
+        return True, None
+
+    schema_metadata = schema.metadata if schema.metadata else {}
+    if _PRIMARY_GEOMETRY_COLUMN_KEY in schema_metadata:
+        primary = schema_metadata[_PRIMARY_GEOMETRY_COLUMN_KEY].decode()
+        if primary and primary in schema.names:
+            return True, primary
+
+        # The recorded primary column is no longer present.
+        return True, None
+
+    return False, None
+
+
+def _geoparquet_with_geometry_roles(tab, geometry_columns, primary_geometry_column):
+    geometry_columns = set(geometry_columns)
+    fields = []
+    for field in tab.schema:
+        if field.name in geometry_columns:
+            metadata = dict(field.metadata) if field.metadata else {}
+            if field.name == primary_geometry_column:
+                metadata[_GEOMETRY_ROLE_KEY] = _GEOMETRY_ROLE_PRIMARY.encode()
+            else:
+                metadata[_GEOMETRY_ROLE_KEY] = _GEOMETRY_ROLE_SECONDARY.encode()
+            field = field.with_metadata(metadata)
+        fields.append(field)
+
+    metadata = dict(tab.schema.metadata) if tab.schema.metadata else {}
+    if primary_geometry_column is None:
+        metadata[_PRIMARY_GEOMETRY_COLUMN_KEY] = b""
+    else:
+        metadata[_PRIMARY_GEOMETRY_COLUMN_KEY] = primary_geometry_column.encode()
+
+    schema = _pa.schema(fields, metadata=metadata)
+    return _pa.Table.from_arrays(tab.columns, schema=schema)
 
 
 def _geoparquet_guess_geometry_columns(schema):
@@ -274,7 +500,16 @@ def _geoparquet_table_to_geoarrow(tab, columns):
 
         col_i = tab.schema.get_field_index(col_name)
         new_geometry = _geoparquet_chunked_array_to_geoarrow(tab[col_i], spec)
-        tab = tab.set_column(col_i, col_name, new_geometry)
+
+        # Preserve any field-level metadata (e.g., a recorded geometry role)
+        field = tab.schema.field(col_i)
+        new_field = _pa.field(
+            field.name,
+            new_geometry.type,
+            nullable=field.nullable,
+            metadata=field.metadata,
+        )
+        tab = tab.set_column(col_i, new_field, new_geometry)
 
     return tab
 
@@ -497,6 +732,18 @@ def _geoparquet_encode_chunked_array(
 
 def geoparquet_encoding_geoarrow():
     return "GEOARROW_ENCODING_SENTINEL"
+
+
+# Schema metadata key recording the name of the primary geometry column. An empty
+# value means that the source had geometry roles but no primary (e.g., the primary
+# column was projected away).
+_PRIMARY_GEOMETRY_COLUMN_KEY = b"geoarrow:primary_geometry_column"
+
+# Field metadata key recording the role of a geometry column ("primary" or
+# "secondary").
+_GEOMETRY_ROLE_KEY = b"geoarrow:geometry_role"
+_GEOMETRY_ROLE_PRIMARY = "primary"
+_GEOMETRY_ROLE_SECONDARY = "secondary"
 
 
 _GEOPARQUET_GEOMETRY_TYPE_LABELS = [

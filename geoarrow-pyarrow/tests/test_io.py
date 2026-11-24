@@ -110,6 +110,152 @@ def test_read_geoparquet_table_geoarrow():
         assert tab2["geometry"].type == ga.point()
 
 
+def _facility_table():
+    return pa.table(
+        [
+            ga.array(["POINT (0 1)"]),
+            ga.array(["POLYGON ((0 0, 0 2, 2 2, 2 0, 0 0))"]),
+            pa.array([1], pa.int64()),
+        ],
+        names=["center", "coverage", "n"],
+    )
+
+
+def _write_and_get_primary(table, tmpdir, name="test.parquet", **kwargs):
+    path = os.path.join(tmpdir, name)
+    io.write_geoparquet_table(table, path, **kwargs)
+    meta = json.loads(parquet.read_schema(path).metadata[b"geo"])
+    return meta
+
+
+def test_read_geoparquet_table_records_geometry_roles():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        temp_pq = os.path.join(tmpdir, "test.parquet")
+        io.write_geoparquet_table(_facility_table(), temp_pq)
+
+        tab = io.read_geoparquet_table(temp_pq)
+        assert io.geoparquet_primary_geometry_column(tab) == "center"
+        assert tab.schema.field("center").metadata[io._GEOMETRY_ROLE_KEY] == b"primary"
+        assert (
+            tab.schema.field("coverage").metadata[io._GEOMETRY_ROLE_KEY] == b"secondary"
+        )
+        assert tab.schema.field("n").metadata is None
+
+
+def test_write_geoparquet_table_restores_recorded_primary():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        temp_pq = os.path.join(tmpdir, "test.parquet")
+        io.write_geoparquet_table(_facility_table(), temp_pq)
+
+        # Rename so that name-based guessing would pick the coverage column as the
+        # default: only the recorded role keeps "shape" as the primary.
+        tab = io.read_geoparquet_table(temp_pq)
+        tab = tab.rename_columns(["shape", "geometry", "n"])
+        meta = _write_and_get_primary(tab, tmpdir, "again.parquet")
+        assert meta["primary_column"] == "shape"
+
+
+def test_write_geoparquet_table_projected_primary_requires_explicit():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        temp_pq = os.path.join(tmpdir, "test.parquet")
+        io.write_geoparquet_table(_facility_table(), temp_pq)
+
+        # A projection that reads only the coverage column has no primary role
+        tab = io.read_geoparquet_table(temp_pq, columns=["coverage"])
+        assert io.geoparquet_primary_geometry_column(tab) is None
+        role = tab.schema.field("coverage").metadata[io._GEOMETRY_ROLE_KEY]
+        assert role == b"secondary"
+
+        # Writing it again must not silently promote coverage to the primary
+        with pytest.raises(ValueError, match="primary geometry column"):
+            io.write_geoparquet_table(tab, os.path.join(tmpdir, "bad.parquet"))
+
+        # ...and designating the new primary explicitly works
+        meta = _write_and_get_primary(
+            tab,
+            tmpdir,
+            "explicit.parquet",
+            primary_geometry_column="coverage",
+        )
+        assert meta["primary_column"] == "coverage"
+
+
+def test_read_geoparquet_table_projection_explicit_primary():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        temp_pq = os.path.join(tmpdir, "test.parquet")
+        io.write_geoparquet_table(_facility_table(), temp_pq)
+
+        tab = io.read_geoparquet_table(
+            temp_pq, columns=["coverage"], primary_geometry_column="coverage"
+        )
+        assert io.geoparquet_primary_geometry_column(tab) == "coverage"
+        role = tab.schema.field("coverage").metadata[io._GEOMETRY_ROLE_KEY]
+        assert role == b"primary"
+
+        with pytest.raises(ValueError, match="not a geometry column present"):
+            io.read_geoparquet_table(
+                temp_pq, columns=["coverage"], primary_geometry_column="center"
+            )
+
+
+def test_write_geoparquet_table_designated_primary_must_be_geometry():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with pytest.raises(ValueError, match="not present in the table"):
+            io.write_geoparquet_table(
+                _facility_table(),
+                os.path.join(tmpdir, "bad.parquet"),
+                primary_geometry_column="not_a_column",
+            )
+
+        # An explicit primary that exists but is not a geometry column is refused
+        with pytest.raises(ValueError, match="not among the geometry columns"):
+            io.write_geoparquet_table(
+                _facility_table(),
+                os.path.join(tmpdir, "bad1.parquet"),
+                primary_geometry_column="n",
+            )
+
+        # A designated primary that exists but is excluded by geometry_columns is
+        # also an error (rather than silently writing a different primary).
+        io.write_geoparquet_table(_facility_table(), os.path.join(tmpdir, "ok.parquet"))
+        tab_roled = io.read_geoparquet_table(os.path.join(tmpdir, "ok.parquet"))
+        with pytest.raises(ValueError, match="not among the geometry columns"):
+            io.write_geoparquet_table(
+                tab_roled,
+                os.path.join(tmpdir, "bad2.parquet"),
+                geometry_columns=["coverage"],
+            )
+
+
+def test_geoparquet_primary_geometry_column_survives_transformations():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        temp_pq = os.path.join(tmpdir, "test.parquet")
+        io.write_geoparquet_table(_facility_table(), temp_pq)
+        tab = io.read_geoparquet_table(temp_pq)
+
+        # Column-level roles survive the transformations that keep columns
+        filtered = tab.filter(pa.array([True]))
+        assert io.geoparquet_primary_geometry_column(filtered) == "center"
+        renamed = tab.rename_columns(["a", "b", "c"])
+        assert io.geoparquet_primary_geometry_column(renamed) == "a"
+
+        # Removing the primary column leaves no primary (rather than promoting one)
+        dropped = tab.drop_columns(["center"])
+        assert io.geoparquet_primary_geometry_column(dropped) is None
+        assert io.geoparquet_primary_geometry_column(tab.select(["n"])) is None
+
+
+def test_geoparquet_get_recorded_primary_conflicting_roles():
+    schema = pa.schema(
+        [
+            pa.field("a", ga.wkb(), metadata={io._GEOMETRY_ROLE_KEY: b"primary"}),
+            pa.field("b", ga.wkb(), metadata={io._GEOMETRY_ROLE_KEY: b"primary"}),
+        ]
+    )
+    with pytest.raises(ValueError, match="more than one geometry column"):
+        io._geoparquet_get_recorded_primary(schema)
+
+
 def test_geoparquet_column_spec_from_type_geom_type():
     spec_wkb = io._geoparquet_column_spec_from_type(ga.wkb())
     assert spec_wkb["geometry_types"] == []

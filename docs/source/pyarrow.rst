@@ -110,6 +110,8 @@ IO helpers
 
     .. autofunction:: write_geoparquet_table
 
+    .. autofunction:: geoparquet_primary_geometry_column
+
 
 Dataset constructors
 --------------------
