@@ -9,6 +9,13 @@ Examples
 
 from geoarrow.pyarrow import _scalar
 from geoarrow.pyarrow._array import array
+from geoarrow.pyarrow.canonical import (
+    CanonicalMode,
+    SIGNATURE_SIZE_BYTES,
+    canonicalize_geometry,
+    compare_snapshots,
+    geometry_signature,
+)
 from geoarrow.pyarrow._compute import (
     as_geoarrow,
     as_wkb,
@@ -70,6 +77,7 @@ from geoarrow.types.type_pyarrow import (
 
 __all__ = [
     "OGC_CRS84",
+    "CanonicalMode",
     "CoordType",
     "Dimensions",
     "EdgeType",
@@ -82,6 +90,7 @@ __all__ = [
     "MultiPolygonType",
     "PointType",
     "PolygonType",
+    "SIGNATURE_SIZE_BYTES",
     "WkbType",
     "WktType",
     "_scalar",
@@ -91,8 +100,11 @@ __all__ = [
     "as_wkt",
     "box",
     "box_agg",
+    "canonicalize_geometry",
+    "compare_snapshots",
     "extension_type",
     "format_wkt",
+    "geometry_signature",
     "geometry_type_common",
     "infer_type_common",
     "large_wkb",

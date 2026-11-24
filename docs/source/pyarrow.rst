@@ -69,8 +69,17 @@ geoarrow-pyarrow
 
     .. autofunction:: to_geopandas
 
+    .. autofunction:: canonicalize_geometry
+
+    .. autofunction:: geometry_signature
+
+    .. autofunction:: compare_snapshots
+
     Class Reference
     ---------------
+
+    .. autoclass:: CanonicalMode
+        :members:
 
     .. autoclass:: GeometryExtensionType
         :members:
