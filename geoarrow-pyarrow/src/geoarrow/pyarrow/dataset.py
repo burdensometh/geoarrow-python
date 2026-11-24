@@ -5,7 +5,9 @@ Experimental geospatial-agumented wrapper around a ``pyarrow.dataset``.
 """
 
 from concurrent.futures import ThreadPoolExecutor, wait
+from dataclasses import dataclass
 
+from geoarrow.pyarrow._compute import box as _ga_box
 from geoarrow.pyarrow._kernel import Kernel
 from geoarrow.pyarrow._type import GeometryExtensionType, wkb, wkt
 from geoarrow.types import CoordType
@@ -15,6 +17,82 @@ import pyarrow.compute as _compute
 import pyarrow.dataset as _ds
 import pyarrow.parquet as _pq
 import pyarrow.types as _types
+
+
+def _fragment_row_count(fragment):
+    """Number of rows a fragment scan yields.
+
+    ``ParquetFileFragment.count_rows()`` ignores the row group filter of a
+    fragment produced by ``split_by_row_group()``, so sum the referenced
+    row groups explicitly where present.
+    """
+    row_groups = getattr(fragment, "row_groups", None)
+    if row_groups:
+        return sum(row_group.num_rows for row_group in row_groups)
+    return fragment.count_rows()
+
+
+def _byte_budget_ranges(n_rows, nbytes, max_bytes):
+    """Split ``range(n_rows)`` into consecutive ``(offset, n_rows)`` ranges.
+
+    ``nbytes(offset, n_rows)`` must return the byte size of a row range.
+    Each emitted range fits within ``max_bytes`` unless it is a single row
+    that exceeds ``max_bytes`` on its own (which is emitted as-is).
+    """
+    ranges = []
+    _byte_budget_ranges_inner(0, n_rows, nbytes, max_bytes, ranges)
+    return ranges
+
+
+def _byte_budget_ranges_inner(offset, n_rows, nbytes, max_bytes, out):
+    if n_rows == 0:
+        return
+    if n_rows == 1 or nbytes(offset, n_rows) <= max_bytes:
+        out.append((offset, n_rows))
+        return
+    half = n_rows // 2
+    _byte_budget_ranges_inner(offset, half, nbytes, max_bytes, out)
+    _byte_budget_ranges_inner(offset + half, n_rows - half, nbytes, max_bytes, out)
+
+
+@dataclass
+class EnvelopeIdBatch:
+    """One budget-bounded batch of computed envelope and business ID columns.
+
+    A single piece of the output of
+    :meth:`GeoDataset.iter_envelope_id_batches`, carrying its provenance:
+    the source fragment (for :class:`ParquetRowGroupGeoDataset`, the source
+    row group) and the half-open row range ``[row_start, row_end)`` within
+    that fragment. ``table`` contains exactly the computed envelope and
+    business ID columns and has ``row_end - row_start`` rows, such that
+    concatenating the tables of all batches in iteration order restores
+    columns aligned row-for-row with the source dataset.
+
+    ``oversized`` is True when the batch holds a single geometry whose
+    serialized size alone exceeds the batching budget. These batches are
+    the independent strategy for oversized geometries: they are always
+    isolated from other rows so that the caller can route them to a
+    dedicated path (e.g., persist and release immediately).
+    """
+
+    fragment_index: int
+    row_start: int
+    row_end: int
+    table: _pa.Table
+    oversized: bool = False
+
+    def __post_init__(self):
+        if self.table.num_rows != self.row_end - self.row_start:
+            raise ValueError(
+                f"Batch table has {self.table.num_rows} rows but row range "
+                f"[{self.row_start}, {self.row_end}) implies "
+                f"{self.row_end - self.row_start}"
+            )
+
+    @property
+    def num_rows(self):
+        """Number of source rows covered by this batch."""
+        return self.table.num_rows
 
 
 class GeoDataset:
@@ -221,6 +299,333 @@ class GeoDataset:
         filtered_parent = self._filter_parent_fragment_indices(fragment_indices)
         return self._wrap_parent(filtered_parent, fragment_indices)
 
+    def _resolve_geometry_column(self, geometry_column):
+        if geometry_column is None:
+            geometry_columns = self.geometry_columns
+            if len(geometry_columns) != 1:
+                raise ValueError(
+                    "geometry_column must be specified for a dataset with "
+                    f"{len(geometry_columns)} geometry columns"
+                )
+            geometry_column = geometry_columns[0]
+
+        if geometry_column not in self.geometry_columns:
+            raise ValueError(
+                f"geometry_column '{geometry_column}' is not a geometry column "
+                "of this dataset"
+            )
+
+        geometry_type = self.geometry_types[
+            self.geometry_columns.index(geometry_column)
+        ]
+        return geometry_column, geometry_type
+
+    def iter_envelope_id_batches(
+        self,
+        geometry_column=None,
+        id_column=None,
+        max_bytes=2**26,
+        batch_size=None,
+        envelope_name="envelope",
+        id_name="id",
+    ):
+        """Iterate over computed envelope and business ID columns in batches.
+
+        EXPERIMENTAL
+
+        Computes two derived columns for this dataset --- a Cartesian 2D
+        envelope (see :func:`geoarrow.pyarrow.box`) and a business ID ---
+        and yields them as :class:`EnvelopeIdBatch` objects whose source
+        geometry size is bounded by ``max_bytes``. Reading a very large
+        Arrow chunk and computing over it in a single step can exhaust
+        memory, so the computation is instead split into consumable
+        batches: each batch carries the index of its source fragment (for
+        :class:`ParquetRowGroupGeoDataset`, its source row group) and the
+        half-open row range ``[row_start, row_end)`` within that fragment.
+
+        This is a lazy generator: the next batch is only read and computed
+        when the caller requests it, so the caller can confirm each batch
+        (e.g., persist or forward it) before any further work happens. At
+        most about ``max_bytes`` of pending source data plus the scanner's
+        read-ahead is held in memory at a time.
+
+        Batches are yielded in dataset row order and are contiguous and
+        non-overlapping, so concatenating the ``table`` of every batch
+        (e.g., with ``pyarrow.concat_tables()``) restores columns that
+        align row-for-row with ``dataset.to_table()``. Use
+        :meth:`collect_envelope_id_table` to do this with coverage
+        validation.
+
+        A single geometry whose serialized size exceeds ``max_bytes``
+        cannot be split further. These are handled with an independent
+        strategy: each is emitted on its own as a single-row batch flagged
+        with ``oversized=True`` (its envelope is still computed), so the
+        caller can route it to a dedicated path.
+
+        Spherical edges are not supported (see :func:`geoarrow.pyarrow.box`).
+
+        Parameters
+        ----------
+        geometry_column : str, optional
+            The geometry column to compute envelopes from. Defaults to the
+            sole geometry column of the dataset.
+        id_column : str, optional
+            An existing column to carry through as the business ID. If
+            omitted, a deterministic business ID is generated as a uint64
+            sequence ``0..N-1`` following dataset row order (which doubles
+            as a row-alignment key back to the source table).
+        max_bytes : int
+            Maximum number of source geometry/ID bytes per batch. This
+            bounds the memory of a single compute step; it is not a limit
+            on the (much smaller) computed output.
+        batch_size : int, optional
+            Record batch size used when scanning fragments. Defaults to the
+            pyarrow scanner default.
+        envelope_name, id_name : str
+            Names of the two output columns in each batch's ``table``.
+
+        Returns
+        -------
+        iterator of :class:`EnvelopeIdBatch`
+
+        >>> import geoarrow.pyarrow.dataset as gads
+        >>> import geoarrow.pyarrow as ga
+        >>> import pyarrow as pa
+        >>> table = pa.table(
+        ...     [ga.array(["POINT (0.5 1.5)", "POINT (2.5 3.5)"])], ["geometry"]
+        ... )
+        >>> dataset = gads.dataset(table)
+        >>> for batch in dataset.iter_envelope_id_batches():
+        ...     print(batch.fragment_index, batch.row_start, batch.row_end, batch.oversized)
+        ...     print(batch.table.to_pydict())
+        0 0 2 False
+        {'envelope': [{'xmin': 0.5, 'ymin': 1.5, 'xmax': 0.5, 'ymax': 1.5}, {'xmin': 2.5, 'ymin': 3.5, 'xmax': 2.5, 'ymax': 3.5}], 'id': [0, 1]}
+
+        A tiny budget splits the rows; a single geometry that alone exceeds
+        the budget is isolated and flagged as oversized:
+
+        >>> batches = list(dataset.iter_envelope_id_batches(max_bytes=1))
+        >>> [(b.row_start, b.row_end, b.oversized) for b in batches]
+        [(0, 1, True), (1, 2, True)]
+        """
+        geometry_column, geometry_type = self._resolve_geometry_column(
+            geometry_column
+        )
+        if id_column is not None:
+            if id_column == geometry_column:
+                raise ValueError("id_column must differ from geometry_column")
+            if id_column not in self.schema.names:
+                raise ValueError(
+                    f"id_column '{id_column}' is not a column of this dataset"
+                )
+        if max_bytes <= 0:
+            raise ValueError("max_bytes must be greater than zero")
+        if batch_size is not None and batch_size <= 0:
+            raise ValueError("batch_size must be greater than zero")
+
+        return self._iter_envelope_id_batches(
+            geometry_column,
+            geometry_type,
+            id_column,
+            max_bytes,
+            batch_size,
+            envelope_name,
+            id_name,
+        )
+
+    def _iter_envelope_id_batches(
+        self,
+        geometry_column,
+        geometry_type,
+        id_column,
+        max_bytes,
+        batch_size,
+        envelope_name,
+        id_name,
+    ):
+        columns = [geometry_column]
+        if id_column is not None:
+            columns.append(id_column)
+        scan_kwargs = {"columns": columns}
+        if batch_size is not None:
+            scan_kwargs["batch_size"] = batch_size
+
+        next_id = 0
+        for fragment_index, fragment in enumerate(self.get_fragments()):
+            row_cursor = 0
+            pending = []
+            pending_bytes = 0
+
+            def build_batch(pieces, oversized):
+                nonlocal next_id
+                row_start = pieces[0][0]
+                row_end = pieces[-1][0] + pieces[-1][1]
+                envelopes = []
+                id_slices = []
+                n_total = 0
+                for _, n_rows, geometry_slice, id_slice in pieces:
+                    envelopes.append(_ga_box(geometry_slice))
+                    if id_slice is not None:
+                        id_slices.append(id_slice)
+                    n_total += n_rows
+
+                if len(envelopes) == 1:
+                    envelope = envelopes[0]
+                else:
+                    envelope = _pa.concat_arrays(envelopes)
+
+                if id_column is not None:
+                    if len(id_slices) == 1:
+                        ids = id_slices[0]
+                    else:
+                        ids = _pa.concat_arrays(id_slices)
+                else:
+                    ids = _pa.array(
+                        range(next_id, next_id + n_total), type=_pa.uint64()
+                    )
+                    next_id += n_total
+
+                table = _pa.Table.from_arrays(
+                    [envelope, ids], names=[envelope_name, id_name]
+                )
+                return EnvelopeIdBatch(
+                    fragment_index, row_start, row_end, table, oversized
+                )
+
+            reader = fragment.scanner(**scan_kwargs).to_reader()
+            for record_batch in reader:
+                n_batch = record_batch.num_rows
+                if n_batch == 0:
+                    continue
+
+                geometry = record_batch.column(geometry_column)
+                if not isinstance(geometry.type, GeometryExtensionType):
+                    geometry = geometry_type.wrap_array(geometry)
+                ids = (
+                    record_batch.column(id_column)
+                    if id_column is not None
+                    else None
+                )
+
+                def slice_nbytes(offset, n_rows):
+                    total = geometry.slice(offset, n_rows).nbytes
+                    if ids is not None:
+                        total += ids.slice(offset, n_rows).nbytes
+                    return total
+
+                ranges = _byte_budget_ranges(n_batch, slice_nbytes, max_bytes)
+                for offset, n_rows in ranges:
+                    piece = (
+                        row_cursor + offset,
+                        n_rows,
+                        geometry.slice(offset, n_rows),
+                        ids.slice(offset, n_rows) if ids is not None else None,
+                    )
+                    piece_bytes = slice_nbytes(offset, n_rows)
+
+                    if n_rows == 1 and piece_bytes > max_bytes:
+                        # Independent strategy for a single oversized
+                        # geometry: flush pending rows, then emit it
+                        # isolated in its own flagged batch.
+                        if pending:
+                            yield build_batch(pending, oversized=False)
+                            pending = []
+                            pending_bytes = 0
+                        yield build_batch([piece], oversized=True)
+                    else:
+                        if pending and pending_bytes + piece_bytes > max_bytes:
+                            yield build_batch(pending, oversized=False)
+                            pending = []
+                            pending_bytes = 0
+                        pending.append(piece)
+                        pending_bytes += piece_bytes
+
+                row_cursor += n_batch
+
+            if pending:
+                yield build_batch(pending, oversized=False)
+
+    def collect_envelope_id_table(self, **kwargs):
+        """Compute envelope and business ID columns for the entire dataset.
+
+        EXPERIMENTAL
+
+        Runs :meth:`iter_envelope_id_batches` (all keyword arguments are
+        passed through), validates that the batches form a gapless, ordered
+        coverage of every fragment (row group), and concatenates them into
+        a single table whose rows align with ``dataset.to_table()``.
+
+        >>> import geoarrow.pyarrow.dataset as gads
+        >>> import geoarrow.pyarrow as ga
+        >>> import pyarrow as pa
+        >>> table = pa.table(
+        ...     [ga.array(["POINT (0.5 1.5)", "POINT (2.5 3.5)"])], ["geometry"]
+        ... )
+        >>> dataset = gads.dataset(table)
+        >>> dataset.collect_envelope_id_table().to_pydict()
+        {'envelope': [{'xmin': 0.5, 'ymin': 1.5, 'xmax': 0.5, 'ymax': 1.5}, {'xmin': 2.5, 'ymin': 3.5, 'xmax': 2.5, 'ymax': 3.5}], 'id': [0, 1]}
+        """
+        batches = list(self.iter_envelope_id_batches(**kwargs))
+        self._validate_envelope_id_coverage(batches)
+
+        if batches:
+            return _pa.concat_tables([batch.table for batch in batches])
+
+        # No rows: rebuild the empty output table with the correct schema
+        geometry_column, geometry_type = self._resolve_geometry_column(
+            kwargs.get("geometry_column")
+        )
+        id_column = kwargs.get("id_column")
+        envelope_name = kwargs.get("envelope_name", "envelope")
+        id_name = kwargs.get("id_name", "id")
+
+        empty_geometry = geometry_type.wrap_array(
+            _pa.array([], type=geometry_type.storage_type)
+        )
+        envelope = _ga_box(empty_geometry)
+        if id_column is not None:
+            ids = _pa.array([], type=self.schema.field(id_column).type)
+        else:
+            ids = _pa.array([], type=_pa.uint64())
+
+        return _pa.Table.from_arrays([envelope, ids], names=[envelope_name, id_name])
+
+    def _validate_envelope_id_coverage(self, batches):
+        """Check that batches cover every dataset row exactly once, in order."""
+        fragment_rows = [_fragment_row_count(f) for f in self.get_fragments()]
+        fragment_index = 0
+        row = 0
+        for batch in batches:
+            while (
+                fragment_index < len(fragment_rows)
+                and row == fragment_rows[fragment_index]
+            ):
+                fragment_index += 1
+                row = 0
+            if (
+                fragment_index == len(fragment_rows)
+                or batch.fragment_index != fragment_index
+                or batch.row_start != row
+                or batch.row_end > fragment_rows[fragment_index]
+            ):
+                raise ValueError(
+                    "Batches do not form a gapless, ordered coverage of the "
+                    f"dataset: unexpected batch {batch!r}"
+                )
+            row = batch.row_end
+
+        while (
+            fragment_index < len(fragment_rows)
+            and row == fragment_rows[fragment_index]
+        ):
+            fragment_index += 1
+            row = 0
+        if fragment_index != len(fragment_rows):
+            raise ValueError(
+                "Batches do not cover the entire dataset: "
+                f"stopped at fragment {fragment_index} of {len(fragment_rows)}"
+            )
+
     def _wrap_parent(self, filtered_parent, fragment_indices):
         new_wrapped = GeoDataset(
             filtered_parent, geometry_columns=self._geometry_columns
@@ -367,6 +772,30 @@ class ParquetRowGroupGeoDataset(GeoDataset):
             geometry_columns=geometry_columns,
             use_column_statistics=use_column_statistics,
         )
+
+    @property
+    def row_group_ids(self):
+        """Row group ID within its source file for each fragment.
+
+        The i-th value is the row group ID of ``get_fragments()[i]`` within
+        its Parquet file, which completes the provenance carried by
+        :class:`EnvelopeIdBatch` (``fragment_index`` + row range) for
+        batches computed by :meth:`GeoDataset.iter_envelope_id_batches`.
+
+        >>> import geoarrow.pyarrow.dataset as gads
+        >>> import geoarrow.pyarrow as ga
+        >>> import pyarrow as pa
+        >>> import pyarrow.parquet as pq
+        >>> import tempfile
+        >>> import os
+        >>> with tempfile.TemporaryDirectory() as td:
+        ...     table = pa.table([ga.array(["POINT (0 1)", "POINT (2 3)"])], ["geometry"])
+        ...     pq.write_table(table, os.path.join(td, "test.parquet"), row_group_size=1)
+        ...     dataset = gads.dataset(os.path.join(td, "test.parquet"))
+        ...     dataset.row_group_ids
+        (0, 1)
+        """
+        return tuple(self._row_group_ids)
 
     def _wrap_parent(self, filtered_parent, fragment_indices):
         base_wrapped = super()._wrap_parent(filtered_parent, fragment_indices)
