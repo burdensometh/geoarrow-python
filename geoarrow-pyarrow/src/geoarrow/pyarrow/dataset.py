@@ -177,7 +177,7 @@ class GeoDataset:
             num_threads=num_threads,
         )
 
-    def filter_fragments(self, target):
+    def filter_fragments(self, target, antimeridian=False):
         """Push down a spatial query into a GeoDataset
 
         Returns a potentially simplified dataset based on the geometry of
@@ -192,6 +192,22 @@ class GeoDataset:
         Note that datasets with large row groups/fragments and/or datasets that
         were not written with fragments with spatial significance may return
         most or all of the fragments in the parent dataset.
+
+        Set ``antimeridian=True`` when ``target`` crosses the antimeridian
+        (180th meridian). The aggregated Cartesian envelope of such a target
+        spans the entire longitude axis (``xmin == -180`` and
+        ``xmax == 180``), which would cause a single envelope comparison to
+        include every fragment whose latitude overlaps, including fragments
+        near longitude zero that are nowhere near the target. When the
+        antimeridian is declared explicitly, the per-feature target envelopes
+        are used to build two longitude ranges, one on each side of the
+        antimeridian, each applied as its own envelope filter; the candidates
+        from both ranges are then merged by stable fragment identity (each
+        fragment is included at most once). The comparison is conservative:
+        fragments whose envelope is too wide to be resolved by the envelope
+        alone (e.g. spanning both sides of the antimeridian) overlap a window
+        and are retained, and inclusive boundaries ensure a fragment on either
+        boundary is never dropped.
 
         >>> import geoarrow.pyarrow.dataset as gads
         >>> import geoarrow.pyarrow as ga
@@ -209,14 +225,28 @@ class GeoDataset:
         ----
         geometry: [["POINT (0.5 1.5)"]]
         """
-        from ._compute import box_agg
+        from ._compute import box, box_agg
 
         if isinstance(target, str):
             target = [target]
-        target_box = box_agg(target).as_py()
-        maybe_intersects = GeoDataset._index_box_intersects(
-            self.index_fragments(), target_box, self.geometry_columns
-        )
+        index = self.index_fragments()
+
+        if antimeridian:
+            # Compute the envelope of each target feature separately: an
+            # aggregated box_agg() would collapse an antimeridian-crossing
+            # target to the full longitude axis (-180..180), discarding the
+            # actual window boundaries. The per-feature boxes describe the two
+            # longitude ranges on either side of the antimeridian.
+            target_boxes = [b.as_py() for b in box(target)]
+            maybe_intersects = GeoDataset._index_box_intersects_antimeridian(
+                index, target_boxes, self.geometry_columns
+            )
+        else:
+            target_box = box_agg(target).as_py()
+            maybe_intersects = GeoDataset._index_box_intersects(
+                index, target_box, self.geometry_columns
+            )
+
         fragment_indices = [scalar.as_py() for scalar in maybe_intersects]
         filtered_parent = self._filter_parent_fragment_indices(fragment_indices)
         return self._wrap_parent(filtered_parent, fragment_indices)
@@ -296,6 +326,62 @@ class GeoDataset:
     @staticmethod
     def _index_box_intersects(index, box, columns):
         xmin, ymin, xmax, ymax = box.values()
+        expr = GeoDataset._box_intersects_expression(columns, xmin, ymin, xmax, ymax)
+        result = _ds.dataset(index).filter(expr).to_table()
+        return result.column(0)
+
+    @staticmethod
+    def _index_box_intersects_antimeridian(index, target_boxes, columns):
+        """Envelope intersection for a target that crosses the antimeridian.
+
+        ``target_boxes`` is the per-feature envelope list of the target (as
+        returned by :func:`geoarrow.pyarrow.box`), not a single aggregated
+        envelope. Aggregating first would collapse the target to the whole
+        longitude axis (``xmin == -180`` and ``xmax == 180``) and discard the
+        real window boundaries, so each feature's box is instead turned into
+        its own longitude/latitude window and applied as a separate envelope
+        filter. The candidates from all windows are then merged by stable
+        fragment identity (the ``_fragment_index`` column), so a fragment
+        matched by more than one window is included only once.
+
+        The comparison is deliberately conservative. Each window uses inclusive
+        interval overlap on both axes (``frag.xmin <= window.xmax`` and
+        ``frag.xmax >= window.xmin``), so a fragment touching either window
+        boundary is never dropped. A fragment whose own envelope is too wide to
+        be resolved by the envelope alone (e.g. a fragment spanning both sides
+        of the antimeridian, whose box reaches into both longitude ranges)
+        overlaps at least one of the windows and is therefore retained as a
+        "maybe intersects" candidate; only fragments that are disjoint from
+        every window on either axis are excluded.
+        """
+        expressions = []
+        for target_box in target_boxes:
+            xmin, ymin, xmax, ymax = target_box.values()
+            # One envelope filter per target feature (each is one longitude
+            # range on one side of the antimeridian).
+            expressions.append(
+                GeoDataset._box_intersects_expression(
+                    columns, xmin, ymin, xmax, ymax
+                )
+            )
+
+        expr = expressions[0]
+        for i in range(1, len(expressions)):
+            expr = expr | expressions[i]
+
+        result = _ds.dataset(index).filter(expr).to_table()
+
+        # Merge candidates by stable fragment identity, preserving the index
+        # ordering so downstream row-group bookkeeping stays consistent.
+        fragment_indices = sorted(
+            {scalar.as_py() for scalar in result.column(0)}
+        )
+        return _pa.array(fragment_indices, type=_pa.int64())
+
+    @staticmethod
+    def _box_intersects_expression(columns, xmin, ymin, xmax, ymax):
+        """Build the OR-combined envelope-intersection expression for one
+        longitude/latitude window across all geometry columns."""
         expressions = []
         for col in columns:
             expr = (
@@ -309,9 +395,7 @@ class GeoDataset:
         expr = expressions[0]
         for i in range(1, len(expressions)):
             expr = expr | expressions[i]
-
-        result = _ds.dataset(index).filter(expr).to_table()
-        return result.column(0)
+        return expr
 
 
 class ParquetRowGroupGeoDataset(GeoDataset):

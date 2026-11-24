@@ -196,6 +196,125 @@ def test_geodataset_parquet_filter_rowgroups_with_stats():
         assert filtered1.num_rows == 1
 
 
+def _antimeridian_target():
+    # A target crossing the antimeridian, declared as the two disjoint
+    # longitude ranges on either side of the 180th meridian.
+    return [
+        "POLYGON ((170 0, 180 0, 180 10, 170 10, 170 0))",
+        "POLYGON ((-180 0, -170 0, -170 10, -180 10, -180 0))",
+    ]
+
+
+def test_geodataset_filter_antimeridian_splits_windows():
+    # Fragments inside either longitude window are kept; a fragment near
+    # longitude zero (which the collapsed global envelope would wrongly
+    # include) is excluded.
+    frag_east = pa.table([ga.array(["POINT (175 5)"])], ["geometry"])
+    frag_west = pa.table([ga.array(["POINT (-175 5)"])], ["geometry"])
+    frag_zero = pa.table([ga.array(["POINT (0 5)"])], ["geometry"])
+
+    geods = gads.dataset([frag_east, frag_west, frag_zero])
+    filtered = geods.filter_fragments(_antimeridian_target(), antimeridian=True)
+
+    assert len(filtered.get_fragments()) == 2
+    kept_boxes = filtered._index.column("geometry").to_pylist()
+    kept_xmin = sorted(box["xmin"] for box in kept_boxes)
+    assert kept_xmin == [-175.0, 175.0]
+
+
+def test_geodataset_filter_antimeridian_keeps_boundary_and_ambiguous():
+    # Conservative behavior: fragments touching a window boundary (170/-170)
+    # and fragments whose envelope is too wide to resolve by the envelope
+    # alone (spanning both sides of the antimeridian) are never dropped.
+    frag_east_edge = pa.table([ga.array(["POINT (170 5)"])], ["geometry"])
+    frag_west_edge = pa.table([ga.array(["POINT (-170 5)"])], ["geometry"])
+    frag_wide = pa.table(
+        [ga.array(["POINT (175 5)", "POINT (-175 5)"])], ["geometry"]
+    )
+    # Wide envelope but latitude-disjoint from the target: still excludable.
+    frag_wide_lat = pa.table(
+        [ga.array(["POINT (175 45)", "POINT (-175 45)"])], ["geometry"]
+    )
+    frag_zero = pa.table([ga.array(["POINT (0 5)"])], ["geometry"])
+
+    geods = gads.dataset(
+        [frag_east_edge, frag_west_edge, frag_wide, frag_wide_lat, frag_zero]
+    )
+    filtered = geods.filter_fragments(_antimeridian_target(), antimeridian=True)
+
+    kept_boxes = filtered._index.column("geometry").to_pylist()
+    kept_xmin = sorted(box["xmin"] for box in kept_boxes)
+    # Both boundary fragments and the ambiguous wide fragment survive;
+    # the latitude-disjoint and longitude-zero fragments do not.
+    assert kept_xmin == [-175.0, -170.0, 170.0]
+
+
+def test_geodataset_filter_antimeridian_merges_by_stable_identity():
+    # A wide fragment overlaps BOTH windows but must be included exactly once
+    # (merged by stable fragment identity, not duplicated).
+    frag_wide = pa.table(
+        [ga.array(["POINT (175 5)", "POINT (-175 5)"])], ["geometry"]
+    )
+    geods = gads.dataset([frag_wide])
+    filtered = geods.filter_fragments(_antimeridian_target(), antimeridian=True)
+    assert len(filtered.get_fragments()) == 1
+    assert filtered._index.column("_fragment_index").to_pylist() == [0]
+
+
+def test_geodataset_filter_antimeridian_default_unchanged():
+    # Without the explicit antimeridian declaration the legacy single-envelope
+    # behavior is preserved (the collapsed envelope over-includes).
+    frag_east = pa.table([ga.array(["POINT (175 5)"])], ["geometry"])
+    frag_zero = pa.table([ga.array(["POINT (0 5)"])], ["geometry"])
+    geods = gads.dataset([frag_east, frag_zero])
+
+    legacy = geods.filter_fragments(_antimeridian_target())
+    assert len(legacy.get_fragments()) == 2
+
+    explicit = geods.filter_fragments(
+        _antimeridian_target(), antimeridian=True
+    )
+    assert len(explicit.get_fragments()) == 1
+
+
+def test_geodataset_filter_antimeridian_multiple_geometry_columns():
+    t1 = pa.table(
+        [ga.array(["POINT (175 5)"]), ga.array(["POINT (0 5)"])], ["g1", "g2"]
+    )
+    t2 = pa.table(
+        [ga.array(["POINT (0 5)"]), ga.array(["POINT (-175 5)"])], ["g1", "g2"]
+    )
+    t3 = pa.table(
+        [ga.array(["POINT (0 5)"]), ga.array(["POINT (10 5)"])], ["g1", "g2"]
+    )
+    geods = gads.dataset([t1, t2, t3], geometry_columns=["g1", "g2"])
+    filtered = geods.filter_fragments(
+        _antimeridian_target(), antimeridian=True
+    )
+    # t1 matches via g1, t2 matches via g2; t3 matches neither column.
+    assert len(filtered.get_fragments()) == 2
+
+
+def test_geodataset_parquet_rowgroups_antimeridian():
+    arr = ga.as_geoarrow(
+        ["POINT (175 5)", "POINT (0 5)", "POINT (-175 5)", "POINT (170 5)"]
+    )
+    table = pa.table([arr], ["geometry"])
+    with TemporaryDirectory() as td:
+        pq.write_table(table, f"{td}/table.parquet", row_group_size=1)
+
+        geods = gads.dataset(f"{td}/table.parquet")
+        assert isinstance(geods, gads.ParquetRowGroupGeoDataset)
+
+        filtered = geods.filter_fragments(
+            _antimeridian_target(), antimeridian=True
+        )
+        assert isinstance(filtered, gads.ParquetRowGroupGeoDataset)
+        # Row groups for 175, -175 and the 170 boundary survive; 0 does not.
+        assert filtered._row_group_ids == [0, 2, 3]
+        assert len(filtered.get_fragments()) == 3
+
+
 def test_parquet_fields_before():
     schema = pa.schema([pa.field("col1", pa.int32()), pa.field("col2", pa.int32())])
     fields_before = gads.ParquetRowGroupGeoDataset._count_fields_before(schema)
