@@ -16,6 +16,33 @@ import pyarrow.dataset as _ds
 import pyarrow.parquet as _pq
 import pyarrow.types as _types
 
+#: Value of the fragment index status column when the fragment's envelope
+#: was taken from Parquet column statistics.
+ENVELOPE_STATISTICS = "statistics"
+
+#: Value of the fragment index status column when the fragment's envelope
+#: was computed by reading the fragment (e.g., because column statistics
+#: were missing or unusable).
+ENVELOPE_COMPUTED = "computed"
+
+#: Value of the fragment index status column when the fragment contains no
+#: non-empty geometries. The envelope of these fragments is null: an empty
+#: geometry has no coordinates, and its "envelope" must not be confused
+#: with a point at the origin.
+ENVELOPE_EMPTY = "empty"
+
+#: Internal status used while building the index for fragments whose
+#: envelope is not yet known (e.g., missing or unusable Parquet
+#: statistics). These fragments are always resolved by reading them before
+#: the index is returned, such that this value never occurs in a finished
+#: index.
+_ENVELOPE_UNKNOWN = "unknown"
+
+_BOX_FIELD_NAMES = ("xmin", "ymin", "xmax", "ymax")
+_BOX_STORAGE_TYPE = _pa.struct(
+    [_pa.field(name, _pa.float64(), nullable=False) for name in _BOX_FIELD_NAMES]
+)
+
 
 class GeoDataset:
     """Geospatial-augmented Dataset
@@ -149,9 +176,21 @@ class GeoDataset:
 
         Currently the simplified geometry is a box in the form of a
         struct array with fields xmin, xmax, ymin, and ymax. The
-        fragment index is curently a table whose first column is the fragment
-        index and whose subsequent columns are named with the geometry column
-        name. A future implementation may handle spherical edges using a type
+        fragment index is a table whose first column is the fragment
+        index and whose subsequent columns are named with the geometry
+        column name, each followed by a ``_<geometry column>_status``
+        column recording how the envelope was obtained:
+
+        - ``"statistics"``: the envelope was taken from Parquet column
+          statistics (only for a :class:`ParquetRowGroupGeoDataset`).
+        - ``"computed"``: the envelope was computed by reading the
+          fragment (e.g., because statistics were missing or unusable).
+        - ``"empty"``: the fragment contains no non-empty geometries.
+          The envelope of these fragments is null: an empty geometry has
+          no coordinates, and its envelope must not be confused with a
+          point at the origin.
+
+        A future implementation may handle spherical edges using a type
         of simplified geometry more suitable to a spherical comparison.
 
         >>> import geoarrow.pyarrow.dataset as gads
@@ -160,7 +199,7 @@ class GeoDataset:
         >>> table = pa.table([ga.array(["POINT (0.5 1.5)"])], ["geometry"])
         >>> dataset = gads.dataset(table)
         >>> dataset.index_fragments().to_pylist()
-        [{'_fragment_index': 0, 'geometry': {'xmin': 0.5, 'ymin': 1.5, 'xmax': 0.5, 'ymax': 1.5}}]
+        [{'_fragment_index': 0, 'geometry': {'xmin': 0.5, 'ymin': 1.5, 'xmax': 0.5, 'ymax': 1.5}, '_geometry_status': 'computed'}]
         """
         if self._index is None:
             self._index = self._build_index(
@@ -193,6 +232,9 @@ class GeoDataset:
         were not written with fragments with spatial significance may return
         most or all of the fragments in the parent dataset.
 
+        Use :meth:`explain_filter` to inspect the per-fragment decisions
+        made by this filter.
+
         >>> import geoarrow.pyarrow.dataset as gads
         >>> import geoarrow.pyarrow as ga
         >>> import pyarrow as pa
@@ -220,6 +262,73 @@ class GeoDataset:
         fragment_indices = [scalar.as_py() for scalar in maybe_intersects]
         filtered_parent = self._filter_parent_fragment_indices(fragment_indices)
         return self._wrap_parent(filtered_parent, fragment_indices)
+
+    def explain_filter(self, target):
+        """Explain the per-fragment decisions made by filter_fragments()
+
+        Returns a table with one row per fragment (one row per row group
+        for a :class:`ParquetRowGroupGeoDataset`): the fragment index, the
+        decision that :meth:`filter_fragments` would make for the fragment
+        ("keep" or "prune"), and a human-readable reason per geometry
+        column (whether its envelope intersects the target and where the
+        envelope came from).
+
+        >>> import geoarrow.pyarrow.dataset as gads
+        >>> import geoarrow.pyarrow as ga
+        >>> import pyarrow as pa
+        >>> table = pa.table([ga.array(["POINT (0.5 1.5)"])], ["geometry"])
+        >>> dataset = gads.dataset(table)
+        >>> dataset.explain_filter("POLYGON ((0 1, 0 2, 1 2, 1 1, 0 1))").to_pylist()
+        [{'_fragment_index': 0, 'decision': 'keep', 'reason': "envelope of column 'geometry' intersects target (envelope source: computed)"}]
+        """
+        from ._compute import box_agg
+
+        if isinstance(target, str):
+            target = [target]
+        target_box = box_agg(target).as_py()
+
+        index = self.index_fragments()
+        decisions = []
+        reasons = []
+        for row in index.to_pylist():
+            fragment_keep = False
+            fragment_reasons = []
+            for col in self.geometry_columns:
+                status = row[GeoDataset._status_column_name(col)]
+                if status == ENVELOPE_EMPTY:
+                    fragment_reasons.append(f"column '{col}' is empty")
+                    continue
+
+                box = row[col]
+                intersects = (
+                    box["xmin"] <= target_box["xmax"]
+                    and box["xmax"] >= target_box["xmin"]
+                    and box["ymin"] <= target_box["ymax"]
+                    and box["ymax"] >= target_box["ymin"]
+                )
+                if intersects:
+                    fragment_keep = True
+                    fragment_reasons.append(
+                        f"envelope of column '{col}' intersects target "
+                        f"(envelope source: {status})"
+                    )
+                else:
+                    fragment_reasons.append(
+                        f"envelope of column '{col}' does not intersect target "
+                        f"(envelope source: {status})"
+                    )
+
+            decisions.append("keep" if fragment_keep else "prune")
+            reasons.append("; ".join(fragment_reasons))
+
+        return _pa.table(
+            [
+                index.column(0),
+                _pa.array(decisions, type=_pa.string()),
+                _pa.array(reasons, type=_pa.string()),
+            ],
+            names=["_fragment_index", "decision", "reason"],
+        )
 
     def _wrap_parent(self, filtered_parent, fragment_indices):
         new_wrapped = GeoDataset(
@@ -249,6 +358,10 @@ class GeoDataset:
             return _ds.InMemoryDataset(tables, schema=self.schema)
 
     @staticmethod
+    def _status_column_name(column):
+        return f"_{column}_status"
+
+    @staticmethod
     def _index_fragment(fragment, column, type):
         scanner = fragment.scanner(columns=[column])
         reader = scanner.to_reader()
@@ -258,46 +371,160 @@ class GeoDataset:
         return kernel.finish().storage
 
     @staticmethod
-    def _index_fragments(fragments, columns, types, num_threads=None):
-        columns = list(columns)
+    def _classify_box(box):
+        """Classify an envelope dict as empty or as a valid envelope.
+
+        Returns (is_empty, box) where box is None for empty envelopes.
+        Empty geometries have no coordinates: an aggregate over zero
+        coordinates is null, NaN, or inverted (e.g., xmin=inf, xmax=-inf),
+        none of which may be treated as a point at the origin.
+        """
+        if box is None:
+            return True, None
+
+        values = [box[name] for name in _BOX_FIELD_NAMES]
+        if any(value is None or value != value for value in values):
+            return True, None
+
+        xmin, ymin, xmax, ymax = values
+        if xmin > xmax or ymin > ymax:
+            return True, None
+
+        return False, dict(zip(_BOX_FIELD_NAMES, values))
+
+    @staticmethod
+    def _classify_scanned_box(box):
+        empty, box = GeoDataset._classify_box(box)
+        if empty:
+            return ENVELOPE_EMPTY, None
+        return ENVELOPE_COMPUTED, box
+
+    @staticmethod
+    def _statistics_all_null(stats):
+        return stats.has_null_count and stats.null_count == stats.num_values
+
+    @staticmethod
+    def _classify_statistics(stats_x, stats_y):
+        """Classify a row group from the Parquet statistics of its x/y columns.
+
+        Returns (status, box): ENVELOPE_STATISTICS with a valid envelope,
+        ENVELOPE_EMPTY for row groups that certainly contain no coordinates,
+        or _ENVELOPE_UNKNOWN when the statistics are missing or unusable
+        (e.g., written without min/max values by an older writer).
+        """
+        if stats_x is None or stats_y is None:
+            return _ENVELOPE_UNKNOWN, None
+
+        if stats_x.has_min_max and stats_y.has_min_max:
+            empty, box = GeoDataset._classify_box(
+                {
+                    "xmin": stats_x.min,
+                    "ymin": stats_y.min,
+                    "xmax": stats_x.max,
+                    "ymax": stats_y.max,
+                }
+            )
+            if not empty:
+                return ENVELOPE_STATISTICS, box
+            # Statistics whose min/max are missing, NaN, or inverted can't
+            # be used for pruning; recompute the envelope from the data.
+            return _ENVELOPE_UNKNOWN, None
+
+        # Statistics without min/max values: an all-null column chunk
+        # certainly contains no coordinates. Anything else may have been
+        # written by an old writer that omitted min/max values, which is
+        # indistinguishable from a row group full of empty geometries
+        # without reading the data.
+        if GeoDataset._statistics_all_null(stats_x) and GeoDataset._statistics_all_null(
+            stats_y
+        ):
+            return ENVELOPE_EMPTY, None
+
+        return _ENVELOPE_UNKNOWN, None
+
+    @staticmethod
+    def _scan_boxes(fragments, tasks, types_by_name, num_threads=None):
+        """Compute envelopes for (column, fragment index) pairs by reading them.
+
+        Returns a dict mapping (column, fragment_index) to (status, box).
+        """
+        results = {}
+        if not tasks:
+            return results
+
         if num_threads is None:
             num_threads = _pa.cpu_count()
 
-        num_fragments = len(fragments)
-        metadata = [_pa.array(range(num_fragments))]
-        if not columns:
-            return _pa.table(metadata, names=["_fragment_index"])
-
         with ThreadPoolExecutor(max_workers=num_threads) as executor:
-            futures = []
-            for column, type in zip(columns, types):
-                for fragment in fragments:
-                    future = executor.submit(
-                        GeoDataset._index_fragment, fragment, column, type
-                    )
-                    futures.append(future)
-
-            wait(futures)
-
-            results = []
-            for i, column in enumerate(columns):
-                results.append(
-                    [
-                        futures[i * num_fragments + j].result()
-                        for j in range(num_fragments)
-                    ]
+            futures = {}
+            for column, fragment_index in tasks:
+                future = executor.submit(
+                    GeoDataset._index_fragment,
+                    fragments[fragment_index],
+                    column,
+                    types_by_name[column],
                 )
+                futures[(column, fragment_index)] = future
 
-            result_arrays = [_pa.concat_arrays(result) for result in results]
-            return _pa.table(
-                metadata + result_arrays, names=["_fragment_index"] + columns
+            wait(futures.values())
+
+            for key, future in futures.items():
+                scanned = future.result()
+                box = scanned[0].as_py() if len(scanned) > 0 else None
+                results[key] = GeoDataset._classify_scanned_box(box)
+
+        return results
+
+    @staticmethod
+    def _envelope_column(classified):
+        """Build the (envelope, status) index columns for one geometry column."""
+        envelopes = _pa.array([box for _, box in classified], type=_BOX_STORAGE_TYPE)
+        status = _pa.array([status for status, _ in classified], type=_pa.string())
+        return envelopes, status
+
+    @staticmethod
+    def _index_table(num_fragments, columns, classified_by_column):
+        fragment_index = _pa.array(range(num_fragments))
+        if not columns:
+            return _pa.table([fragment_index], names=["_fragment_index"])
+
+        arrays = []
+        names = []
+        for column in columns:
+            envelopes, status = GeoDataset._envelope_column(
+                classified_by_column[column]
             )
+            arrays.extend([envelopes, status])
+            names.extend([column, GeoDataset._status_column_name(column)])
+
+        return _pa.table([fragment_index] + arrays, names=["_fragment_index"] + names)
+
+    @staticmethod
+    def _index_fragments(fragments, columns, types, num_threads=None):
+        columns = list(columns)
+        num_fragments = len(fragments)
+        types_by_name = dict(zip(columns, types))
+
+        tasks = [
+            (column, fragment_index)
+            for column in columns
+            for fragment_index in range(num_fragments)
+        ]
+        scanned = GeoDataset._scan_boxes(fragments, tasks, types_by_name, num_threads)
+
+        classified_by_column = {
+            column: [scanned[(column, j)] for j in range(num_fragments)]
+            for column in columns
+        }
+        return GeoDataset._index_table(num_fragments, columns, classified_by_column)
 
     @staticmethod
     def _index_box_intersects(index, box, columns):
         xmin, ymin, xmax, ymax = box.values()
         expressions = []
         for col in columns:
+            # Fragments without an envelope (i.e., empty fragments, whose
+            # status is "empty") evaluate to null here and are excluded.
             expr = (
                 (_compute.field(col, "xmin") <= xmax)
                 & (_compute.field(col, "xmax") >= xmin)
@@ -323,6 +550,14 @@ class ParquetRowGroupGeoDataset(GeoDataset):
     smaller fragments and (2) use column statistics added by most Parquet
     writers to more efficiently build the fragment index for types that support
     this capability.
+
+    When column statistics are used, each row group is classified as having
+    a valid envelope (``"statistics"``), as certainly containing no
+    coordinates (``"empty"``), or as unknown. Row groups whose statistics
+    are missing or unusable (e.g., written without min/max values by an
+    older writer) are read to compute their envelope, such that they are
+    never confused with empty row groups nor silently dropped by
+    :meth:`filter_fragments`.
     """
 
     def __init__(
@@ -383,6 +618,12 @@ class ParquetRowGroupGeoDataset(GeoDataset):
         new_wrapped._index = base_wrapped._index
         return new_wrapped
 
+    def explain_filter(self, target):
+        explained = super().explain_filter(target)
+        return explained.append_column(
+            "_row_group_id", _pa.array(self._row_group_ids, type=_pa.int64())
+        )
+
     def _build_index(self, geometry_columns, geometry_types, num_threads=None):
         can_use_statistics = [
             type.coord_type == CoordType.SEPARATED for type in self.geometry_types
@@ -391,34 +632,53 @@ class ParquetRowGroupGeoDataset(GeoDataset):
         if not self._use_column_statistics or not any(can_use_statistics):
             return super()._build_index(geometry_columns, geometry_types, num_threads)
 
-        # Build a list of columns that will work with column stats
-        bbox_stats_cols = []
+        fragments = self.get_fragments()
+        num_fragments = len(fragments)
+        types_by_name = dict(zip(geometry_columns, geometry_types))
+
+        # Classify row groups using Parquet column statistics where possible.
+        # This distinguishes row groups with a valid envelope, row groups that
+        # certainly contain no coordinates, and row groups whose envelope is
+        # unknown (e.g., statistics that were never written or that were
+        # written without min/max values by an older writer).
+        classified_by_column = {}
+        scan_tasks = []
+
+        stats_columns = [
+            col
+            for col, use_stats in zip(geometry_columns, can_use_statistics)
+            if use_stats
+        ]
+        stats_results = self._build_index_using_stats(stats_columns)
+        for col in stats_columns:
+            classified = stats_results[col]
+            for fragment_index, (status, box) in enumerate(classified):
+                if status == _ENVELOPE_UNKNOWN:
+                    scan_tasks.append((col, fragment_index))
+            classified_by_column[col] = classified
+
+        # Columns whose type can't use column statistics are indexed by
+        # reading every row group.
         for col, use_stats in zip(geometry_columns, can_use_statistics):
-            if use_stats:
-                bbox_stats_cols.append(col)
+            if not use_stats:
+                classified_by_column[col] = [(_ENVELOPE_UNKNOWN, None)] * num_fragments
+                scan_tasks.extend((col, j) for j in range(num_fragments))
 
-        # Compute the column stats
-        bbox_stats = self._build_index_using_stats(bbox_stats_cols)
-        normal_stats_cols = list(geometry_columns)
-        stats_by_name = {}
-        for col, stat in zip(bbox_stats_cols, bbox_stats):
-            # stat will contain nulls if any statistics were missing:
-            if stat.null_count == 0:
-                stats_by_name[col] = stat
-                normal_stats_cols.remove(col)
-
-        # Compute any remaining statistics
-        normal_stats = super()._build_index(
-            normal_stats_cols, geometry_types, num_threads
+        # Row groups with missing or unusable statistics are read to compute
+        # their envelope (rather than being silently dropped or conservatively
+        # kept by the filter).
+        scanned = GeoDataset._scan_boxes(
+            fragments, scan_tasks, types_by_name, num_threads
         )
-        for col in normal_stats_cols:
-            stats_by_name[col] = normal_stats.column(col)
 
-        # Reorder stats to match the order of geometry_columns
-        stat_cols = [stats_by_name[col] for col in geometry_columns]
-        return _pa.table(
-            [normal_stats.column(0)] + stat_cols,
-            names=["_fragment_index"] + list(geometry_columns),
+        for col in geometry_columns:
+            classified_by_column[col] = [
+                scanned[(col, j)] if status == _ENVELOPE_UNKNOWN else (status, box)
+                for j, (status, box) in enumerate(classified_by_column[col])
+            ]
+
+        return GeoDataset._index_table(
+            num_fragments, list(geometry_columns), classified_by_column
         )
 
     def _build_index_using_stats(self, geometry_columns):
@@ -429,45 +689,30 @@ class ParquetRowGroupGeoDataset(GeoDataset):
         parquet_fields_before = [
             parquet_fields_before[(col,)] for col in geometry_columns
         ]
-        return self._parquet_field_boxes(parquet_fields_before)
+        return self._parquet_field_boxes(parquet_fields_before, geometry_columns)
 
-    def _parquet_field_boxes(self, parquet_indices):
-        boxes = [[]] * len(parquet_indices)
+    def _parquet_field_boxes(self, parquet_indices, geometry_columns):
+        classified = {col: [] for col in geometry_columns}
         pq_file = None
-        last_row_group = None
+        last_path = None
 
         # Note: probably worth parallelizing by file
         for row_group, fragment in zip(self._row_group_ids, self.get_fragments()):
-            if pq_file is None or row_group < last_row_group:
+            if pq_file is None or fragment.path != last_path:
                 pq_file = _pq.ParquetFile(
                     fragment.path, filesystem=self._parent.filesystem
                 )
+                last_path = fragment.path
 
             metadata = pq_file.metadata.row_group(row_group)
-            for i, parquet_index in enumerate(parquet_indices):
+            for col, parquet_index in zip(geometry_columns, parquet_indices):
                 stats_x = metadata.column(parquet_index).statistics
                 stats_y = metadata.column(parquet_index + 1).statistics
+                classified[col].append(
+                    GeoDataset._classify_statistics(stats_x, stats_y)
+                )
 
-                if stats_x is None or stats_y is None:
-                    boxes[i].append(None)
-                else:
-                    boxes[i].append(
-                        {
-                            "xmin": stats_x.min,
-                            "ymin": stats_y.min,
-                            "xmax": stats_x.max,
-                            "ymax": stats_y.max,
-                        }
-                    )
-
-            last_row_group = row_group
-
-        type_field_names = ["xmin", "ymin", "xmax", "ymax"]
-        type_fields = [
-            _pa.field(name, _pa.float64(), nullable=False) for name in type_field_names
-        ]
-        type = _pa.struct(type_fields)
-        return [_pa.array(box, type=type) for box in boxes]
+        return classified
 
     @staticmethod
     def _count_fields_before(field, fields_before=None, path=(), count=0):
