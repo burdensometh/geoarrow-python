@@ -9,6 +9,16 @@ Examples
 
 from geoarrow.pyarrow import _scalar
 from geoarrow.pyarrow._array import array
+from geoarrow.pyarrow._axis import (
+    AxisOrderEvidence,
+    AxisOrderFix,
+    AxisOrderStatus,
+    AxisOrderVerdict,
+    axis_order_evidence,
+    check_axis_order,
+    fix_axis_order,
+    swap_axes,
+)
 from geoarrow.pyarrow._compute import (
     as_geoarrow,
     as_wkb,
@@ -70,6 +80,10 @@ from geoarrow.types.type_pyarrow import (
 
 __all__ = [
     "OGC_CRS84",
+    "AxisOrderEvidence",
+    "AxisOrderFix",
+    "AxisOrderStatus",
+    "AxisOrderVerdict",
     "CoordType",
     "Dimensions",
     "EdgeType",
@@ -89,9 +103,12 @@ __all__ = [
     "as_geoarrow",
     "as_wkb",
     "as_wkt",
+    "axis_order_evidence",
     "box",
     "box_agg",
+    "check_axis_order",
     "extension_type",
+    "fix_axis_order",
     "format_wkt",
     "geometry_type_common",
     "infer_type_common",
@@ -108,6 +125,8 @@ __all__ = [
     "polygon",
     "rechunk",
     "register_extension_types",
+    "rechunk",
+    "swap_axes",
     "to_geopandas",
     "unique_geometry_types",
     "unregister_extension_types",

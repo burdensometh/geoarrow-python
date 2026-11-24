@@ -316,6 +316,62 @@ def create(obj) -> Optional[Crs]:
         raise ValueError(f"Can't create geoarrow.types.Crs from {obj}")
 
 
+_AXIS_DIRECTIONS = {"east": "x", "north": "y", "west": "x", "south": "y"}
+
+
+def crs_axis_order(crs) -> Optional[tuple]:
+    """Inspect the axis order declared by a coordinate reference system.
+
+    The declared order is reported as a tuple with one entry per axis.  Each
+    entry is the axis abbreviation when one is available (for example
+    ``"Lon"``) and otherwise the axis name or direction.  This is only for
+    diagnostics: GeoArrow and GeoParquet always store ordinates in x, y
+    order regardless of what a CRS declares.
+
+    Parameters
+    ----------
+    crs : crs-like or None
+        A CRS-like object (i.e., with ``to_json_dict()``), a PROJJSON
+        string/dict, or ``None``.
+
+    Returns
+    -------
+    tuple of str or None
+        ``None`` when the CRS is unset or does not declare an axis order.
+
+    Examples
+    --------
+    >>> from geoarrow.types import crs
+    >>> crs.crs_axis_order(crs.OGC_CRS84)
+    ('Lon', 'Lat')
+    """
+    crs_obj = crs if crs is UNSPECIFIED else create(crs)
+    if crs_obj is None or crs_obj is UNSPECIFIED:
+        return None
+
+    try:
+        crs_dict = crs_obj.to_json_dict()
+    except (ValueError, AttributeError):
+        return None
+
+    coordinate_system = crs_dict.get("coordinate_system")
+    if not isinstance(coordinate_system, Mapping):
+        return None
+
+    axes = coordinate_system.get("axis")
+    if not axes:
+        return None
+
+    out = []
+    for axis in axes:
+        if not isinstance(axis, Mapping):
+            out.append(None)
+            continue
+        label = axis.get("abbreviation") or axis.get("name") or axis.get("direction")
+        out.append(label)
+    return tuple(out)
+
+
 def _coalesce2(value, default):
     if value is UNSPECIFIED:
         return default

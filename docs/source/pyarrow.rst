@@ -69,6 +69,25 @@ geoarrow-pyarrow
 
     .. autofunction:: to_geopandas
 
+    Axis order
+    ----------
+
+    .. autofunction:: check_axis_order
+
+    .. autofunction:: axis_order_evidence
+
+    .. autofunction:: fix_axis_order
+
+    .. autofunction:: swap_axes
+
+    .. autoclass:: AxisOrderStatus
+
+    .. autoclass:: AxisOrderVerdict
+
+    .. autoclass:: AxisOrderEvidence
+
+    .. autoclass:: AxisOrderFix
+
     Class Reference
     ---------------
 

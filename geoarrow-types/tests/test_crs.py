@@ -90,3 +90,23 @@ def test_crs_common():
 
     with pytest.raises(ValueError):
         crs._common2(None, crs.OGC_CRS84)
+
+
+def test_crs_axis_order():
+    assert crs.crs_axis_order(crs.OGC_CRS84) == ("Lon", "Lat")
+    assert crs.crs_axis_order(crs.OGC_CRS84.to_json()) == ("Lon", "Lat")
+    assert crs.crs_axis_order(crs.OGC_CRS84.to_json_dict()) == ("Lon", "Lat")
+    assert crs.crs_axis_order(None) is None
+    assert crs.crs_axis_order(crs.UNSPECIFIED) is None
+
+
+def test_crs_axis_order_epsg():
+    assert crs.crs_axis_order("EPSG:4326") == ("Lat", "Lon")
+    assert crs.crs_axis_order("EPSG:3857") == ("X", "Y")
+
+
+def test_crs_axis_order_no_axis():
+    assert crs.crs_axis_order({"type": "GeographicCRS", "name": "x"}) is None
+    assert (
+        crs.crs_axis_order({"coordinate_system": {"subtype": "ellipsoidal"}}) is None
+    )
