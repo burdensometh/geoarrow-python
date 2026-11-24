@@ -15,3 +15,9 @@ geoarrow-pandas
 
     .. autoclass:: GeoArrowExtensionScalar
         :members:
+
+Survey point consolidation
+--------------------------
+
+.. automodule:: geoarrow.pandas.survey
+    :members:
