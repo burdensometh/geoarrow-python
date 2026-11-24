@@ -91,6 +91,7 @@ __all__ = [
     "as_wkt",
     "box",
     "box_agg",
+    "classify_geometry",
     "extension_type",
     "format_wkt",
     "geometry_type_common",
@@ -102,12 +103,16 @@ __all__ = [
     "multilinestring",
     "multipoint",
     "multipolygon",
+    "parse",
     "parse_all",
+    "parse_batch",
+    "parse_dataset",
     "point",
     "point_coords",
     "polygon",
     "rechunk",
     "register_extension_types",
+    "summarize_parse_status",
     "to_geopandas",
     "unique_geometry_types",
     "unregister_extension_types",
@@ -121,6 +126,16 @@ __all__ = [
     "wkt",
     "wkt_view",
 ]
+
+# Import last: parse.py refers back to names defined above
+# (e.g. GeometryExtensionType).
+from geoarrow.pyarrow import parse  # NOQA: E402
+from geoarrow.pyarrow.parse import (  # NOQA: E402
+    classify_geometry,
+    parse_batch,
+    parse_dataset,
+    summarize_parse_status,
+)
 
 try:
     register_extension_types()

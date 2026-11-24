@@ -37,6 +37,14 @@ geoarrow-pyarrow
 
     .. autofunction:: parse_all
 
+    .. autofunction:: classify_geometry
+
+    .. autofunction:: parse_batch
+
+    .. autofunction:: parse_dataset
+
+    .. autofunction:: summarize_parse_status
+
     .. autofunction:: unique_geometry_types
 
     .. autofunction:: infer_type_common
