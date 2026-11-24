@@ -123,3 +123,12 @@ Dataset constructors
 
     .. autoclass:: geoarrow.pyarrow.dataset.ParquetRowGroupGeoDataset
         :members:
+
+    The row-group index of a :class:`geoarrow.pyarrow.dataset.ParquetRowGroupGeoDataset`
+    can be persisted to a sidecar file with :meth:`~geoarrow.pyarrow.dataset.ParquetRowGroupGeoDataset.save_index`
+    and reused with :meth:`~geoarrow.pyarrow.dataset.ParquetRowGroupGeoDataset.load_index`.
+    Entries store the identity of the file and row group they describe; on open,
+    matching entries are reused and only fragments whose identity changed are
+    recomputed. A missing, corrupt, or mismatched index is ignored rather than
+    trusted, and fragments with an unknown envelope are always scanned so that
+    a stale index cannot hide data.
