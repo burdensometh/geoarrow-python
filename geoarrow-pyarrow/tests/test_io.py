@@ -396,3 +396,287 @@ def test_table_to_geoarrow():
         tab_no_cols, {"col_name": {"encoding": "WKB"}}
     )
     assert tab_no_cols_geo == tab_no_cols
+
+
+def _write_historical_geoparquet(
+    tmp_path, item, spec, col_name="geometry", version="1.1.0"
+):
+    # Write a "historical" GeoParquet file that carries both the Arrow
+    # extension type (field-level metadata) and the "geo" schema metadata key.
+    # pyarrow preserves the extension type on write/read.
+    tab = pa.table([item], names=[col_name])
+    geo_meta = {
+        "version": version,
+        "primary_column": col_name,
+        "columns": {col_name: spec},
+    }
+    metadata = dict(tab.schema.metadata or {})
+    metadata["geo"] = json.dumps(geo_meta)
+    path = os.path.join(tmp_path, "historical.parquet")
+    parquet.write_table(tab.replace_schema_metadata(metadata), path)
+    return path
+
+
+def test_read_geoparquet_strict_consistent_geoarrow(tmp_path):
+    # A correctly written file with an extension type + matching "geo" spec
+    # reads back into exactly the same geometry type under strict mode.
+    item = ga.as_geoarrow(["POINT (0 1)"])
+    spec = {"encoding": "point", "geometry_types": ["Point"], "crs": None}
+    path = _write_historical_geoparquet(tmp_path, item, spec)
+
+    tab = io.read_geoparquet_table(path, strict=True)
+    assert tab["geometry"].type == ga.point()
+
+    # Default (non-strict) behaviour is unchanged
+    assert io.read_geoparquet_table(path)["geometry"].type == ga.point()
+
+
+def test_read_geoparquet_strict_consistent_spherical(tmp_path):
+    item = ga.with_edge_type(
+        ga.as_geoarrow(["POINT (0 1)"]), ga.EdgeType.SPHERICAL
+    )
+    spec = {
+        "encoding": "point",
+        "geometry_types": ["Point"],
+        "crs": None,
+        "edges": "spherical",
+    }
+    path = _write_historical_geoparquet(tmp_path, item, spec)
+
+    tab = io.read_geoparquet_table(path, strict=True)
+    assert tab["geometry"].type.edge_type == ga.EdgeType.SPHERICAL
+
+
+def test_read_geoparquet_strict_consistent_wkb_equivalent_crs(tmp_path):
+    # A serialized (WKB) extension type restored by the Arrow reader carries a
+    # CRS; the same CRS expressed via an equivalent PROJJSON expression in the
+    # column spec must not be reported as a conflict.
+    restored_crs = types.crs.create("OGC:CRS84").to_json_dict()
+    item = ga.as_wkb(["POINT (0 1)"])
+    spec = {"encoding": "WKB", "geometry_types": [], "crs": restored_crs}
+    path = _write_historical_geoparquet(tmp_path, item, spec, version="1.0.0")
+
+    tab = io.read_geoparquet_table(path, strict=True)
+    assert isinstance(tab["geometry"].type, ga.WkbType)
+
+    # The same CRS expressed as a PROJJSON string is also an equivalent
+    # expression and must likewise be accepted.
+    spec["crs"] = json.dumps(restored_crs)
+    path2 = _write_historical_geoparquet(tmp_path, item, spec, version="1.0.0")
+    tab2 = io.read_geoparquet_table(path2, strict=True)
+    assert isinstance(tab2["geometry"].type, ga.WkbType)
+
+
+def test_read_geoparquet_strict_crs_conflict_explicit_unknown(tmp_path):
+    # The extension type carries a CRS but the spec explicitly says the CRS is
+    # unknown ("crs": null): reading it as-is would assign spatial meaning that
+    # the file disclaims, so strict mode must fail.
+    item = ga.as_wkb(["POINT (0 1)"])
+    spec = {"encoding": "WKB", "geometry_types": [], "crs": None}
+    path = _write_historical_geoparquet(tmp_path, item, spec, version="1.0.0")
+
+    with pytest.raises(ValueError, match="crs mismatch"):
+        io.read_geoparquet_table(path, strict=True)
+
+    # Non-strict reading preserves the extension type (previous behaviour)
+    tab = io.read_geoparquet_table(path)
+    assert isinstance(tab["geometry"].type, ga.WkbType)
+
+
+def test_read_geoparquet_strict_crs_conflict_extension_unset(tmp_path):
+    # Extension type with no CRS, but the spec omits "crs" which per the
+    # GeoParquet specification implicitly means OGC:CRS84.
+    item = ga.as_geoarrow(["POINT (0 1)"])
+    spec = {"encoding": "point", "geometry_types": ["Point"]}
+    path = _write_historical_geoparquet(tmp_path, item, spec)
+
+    with pytest.raises(ValueError, match="crs mismatch"):
+        io.read_geoparquet_table(path, strict=True)
+
+
+def test_read_geoparquet_strict_crs_conflict_different_crs(tmp_path):
+    item = ga.as_geoarrow(["POINT (0 1)"])
+    spec = {
+        "encoding": "point",
+        "geometry_types": ["Point"],
+        "crs": types.OGC_CRS84.to_json_dict(),
+    }
+    path = _write_historical_geoparquet(tmp_path, item, spec)
+
+    with pytest.raises(ValueError, match="crs mismatch"):
+        io.read_geoparquet_table(path, strict=True)
+
+
+def test_read_geoparquet_strict_edges_conflict(tmp_path):
+    item = ga.as_geoarrow(["POINT (0 1)"])
+    spec = {
+        "encoding": "point",
+        "geometry_types": ["Point"],
+        "crs": None,
+        "edges": "spherical",
+    }
+    path = _write_historical_geoparquet(tmp_path, item, spec)
+
+    with pytest.raises(ValueError, match="edges mismatch"):
+        io.read_geoparquet_table(path, strict=True)
+
+    # Non-strict reading keeps the (planar) extension type
+    tab = io.read_geoparquet_table(path)
+    assert tab["geometry"].type.edge_type == ga.EdgeType.PLANAR
+
+
+def test_read_geoparquet_strict_encoding_conflict(tmp_path):
+    item = ga.as_geoarrow(["POINT (0 1)"])
+    spec = {"encoding": "WKB", "crs": None}
+    path = _write_historical_geoparquet(tmp_path, item, spec, version="1.0.0")
+
+    with pytest.raises(ValueError, match="encoding mismatch"):
+        io.read_geoparquet_table(path, strict=True)
+
+
+def test_read_geoparquet_strict_reports_all_conflicts(tmp_path):
+    # Multiple distinct conflicts in the same column are reported together in
+    # a single error.
+    item = ga.as_geoarrow(["POINT (0 1)"])
+    spec = {
+        "encoding": "WKB",
+        "crs": types.OGC_CRS84.to_json_dict(),
+        "edges": "spherical",
+    }
+    path = _write_historical_geoparquet(tmp_path, item, spec, version="1.0.0")
+
+    with pytest.raises(ValueError) as excinfo:
+        io.read_geoparquet_table(path, strict=True)
+    message = str(excinfo.value)
+    assert "encoding mismatch" in message
+    assert "crs mismatch" in message
+    assert "edges mismatch" in message
+
+
+def test_read_geoparquet_strict_aggregates_columns(tmp_path):
+    # Conflicts in several columns are aggregated into one error that names
+    # every affected column.
+    tab = pa.table(
+        {
+            "g1": ga.as_geoarrow(["POINT (0 1)"]),
+            "g2": ga.as_geoarrow(["POINT (0 1)"]),
+        }
+    )
+    geo_meta = {
+        "version": "1.1.0",
+        "primary_column": "g1",
+        "columns": {
+            "g1": {"encoding": "WKB", "crs": None},
+            "g2": {"encoding": "linestring", "crs": None},
+        },
+    }
+    metadata = dict(tab.schema.metadata or {})
+    metadata["geo"] = json.dumps(geo_meta)
+    path = os.path.join(tmp_path, "two_columns.parquet")
+    parquet.write_table(tab.replace_schema_metadata(metadata), path)
+
+    with pytest.raises(ValueError) as excinfo:
+        io.read_geoparquet_table(path, strict=True)
+    message = str(excinfo.value)
+    assert "column 'g1'" in message
+    assert "column 'g2'" in message
+
+
+def test_read_geoparquet_strict_invalid_edges_value(tmp_path):
+    item = ga.as_geoarrow(["POINT (0 1)"])
+    spec = {
+        "encoding": "point",
+        "geometry_types": ["Point"],
+        "crs": None,
+        "edges": "not-a-real-edge-type",
+    }
+    path = _write_historical_geoparquet(tmp_path, item, spec)
+
+    with pytest.raises(ValueError, match="invalid GeoParquet column edges value"):
+        io.read_geoparquet_table(path, strict=True)
+
+
+def test_read_geoparquet_strict_ignored_without_geo_metadata(tmp_path):
+    # A regular Parquet file has no authoritative column specification, so the
+    # guessed geometry column is not strict-checked.
+    path = os.path.join(tmp_path, "plain.parquet")
+    parquet.write_table(
+        pa.table([pa.array(["POINT (0 1)"])], names=["geometry"]), path
+    )
+    tab = io.read_geoparquet_table(path, strict=True)
+    assert isinstance(tab["geometry"].type, ga.GeometryExtensionType)
+
+
+def test_read_geoparquet_strict_skips_unread_columns(tmp_path):
+    item = ga.as_geoarrow(["POINT (0 1)"])
+    spec = {"encoding": "WKB", "crs": None}
+    path = _write_historical_geoparquet(tmp_path, item, spec, version="1.0.0")
+
+    # The conflicting column is not read; its specification must be ignored.
+    tab = io.read_geoparquet_table(path, strict=True, columns=[])
+    assert tab.schema.names == []
+
+
+def test_read_geoparquet_strict_non_extension_file(tmp_path):
+    # A normal library-written WKB file (storage type, no extension type)
+    # passes strict mode and reads as before.
+    path = os.path.join(tmp_path, "normal.parquet")
+    io.write_geoparquet_table(
+        pa.table([ga.array(["POINT (0 1)"])], names=["geometry"]),
+        path,
+        geometry_encoding="WKB",
+    )
+    tab = io.read_geoparquet_table(path, strict=True)
+    assert isinstance(tab["geometry"].type, ga.WkbType)
+
+
+def test_geoparquet_extension_type_conflicts():
+    # Unit-level coverage of the per-column conflict reporter, including the
+    # encoding labels for serialized types.
+    wkb_spec = {"encoding": "WKB", "crs": None}
+    assert io._geoparquet_extension_type_conflicts(ga.wkb(), wkb_spec) == []
+
+    wkt_spec = {"encoding": "WKT", "crs": None}
+    assert io._geoparquet_extension_type_conflicts(ga.wkt(), wkt_spec) == []
+
+    point_spec = {"encoding": "point", "crs": None}
+    assert io._geoparquet_extension_type_conflicts(ga.point(), point_spec) == []
+
+    # Wrong encoding label is detected for both native and serialized types
+    assert any(
+        "encoding mismatch" in c
+        for c in io._geoparquet_extension_type_conflicts(ga.point(), wkb_spec)
+    )
+    assert any(
+        "encoding mismatch" in c
+        for c in io._geoparquet_extension_type_conflicts(ga.wkb(), point_spec)
+    )
+
+    # A missing "encoding" key simply disables the encoding check
+    conflicts = io._geoparquet_extension_type_conflicts(
+        ga.point(), {"crs": None}
+    )
+    assert not any("encoding mismatch" in c for c in conflicts)
+
+
+def test_geoparquet_table_to_geoarrow_strict():
+    item = pa.chunked_array([ga.as_geoarrow(["POINT (0 1)"])])
+    tab = pa.table([item], names=["geometry"])
+
+    # A consistent specification passes and preserves the extension type
+    out = io._geoparquet_table_to_geoarrow(
+        tab, {"geometry": {"encoding": "point", "crs": None}}, strict=True
+    )
+    assert out["geometry"].type == ga.point()
+
+    # A conflicting specification raises before any columns are rewritten
+    with pytest.raises(ValueError, match="encoding mismatch"):
+        io._geoparquet_table_to_geoarrow(
+            tab, {"geometry": {"encoding": "WKB", "crs": None}}, strict=True
+        )
+
+    # Without strict, the extension type is accepted regardless of the spec
+    out = io._geoparquet_table_to_geoarrow(
+        tab, {"geometry": {"encoding": "WKB", "crs": None}}
+    )
+    assert out["geometry"].type == ga.point()

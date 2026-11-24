@@ -10,6 +10,7 @@ import json
 
 import geoarrow.pyarrow as _ga
 from geoarrow.pyarrow import _compute, _type
+from geoarrow.types import crs as _crs
 
 import pyarrow as _pa
 import pyarrow.parquet as _pq
@@ -87,7 +88,7 @@ def read_pyogrio_table(*args, **kwargs):
     return table.set_column(geometry_index, geometry_name_out, geometry)
 
 
-def read_geoparquet_table(*args, **kwargs):
+def read_geoparquet_table(*args, strict=False, **kwargs):
     """Read GeoParquet using PyArrow
 
     A thin wrapper around ``pyarrow.parquet.read_parquet()`` that ensures any columns
@@ -104,6 +105,24 @@ def read_geoparquet_table(*args, **kwargs):
     information is currently lost on read. To minimize the chances of misinterpreting
     the primary geometry column, use ``geometry`` as the name of the column or
     refer to columns explicitly.
+
+    Parameters
+    ----------
+    strict : bool, optional
+        If ``True``, check every geometry column that is declared in the file's
+        ``geo`` metadata and was read as a GeoArrow extension type against the
+        column specification in that metadata. Conflicts for the encoding,
+        coordinate reference system (``crs``), and edge type (``edges``) are
+        collected and reported together as a ``ValueError`` rather than silently
+        honoring the extension type. Equivalent expressions of the same CRS
+        (e.g., a PROJJSON dict and the equivalent PROJJSON string) do not
+        conflict. A CRS that is explicitly unknown (``"crs": null``) or only
+        implicitly defined by a missing ``crs`` key is treated as defined by the
+        GeoParquet specification. Columns without a declaration in the ``geo``
+        metadata (e.g., a geometry column guessed from a regular Parquet file)
+        are not checked. The default of ``False`` preserves the previous
+        behaviour: a correctly written file reads back into exactly the same
+        geometry type it was written with.
 
     >>> import geoarrow.pyarrow as ga
     >>> from geoarrow.pyarrow import io
@@ -137,9 +156,13 @@ def read_geoparquet_table(*args, **kwargs):
     if "columns" in geo_meta:
         columns = geo_meta["columns"]
     else:
+        # A column that was only guessed (e.g., a binary "geometry" column in
+        # a regular Parquet file) has no authoritative specification to check
+        # against, so strict checking only applies to declared columns.
+        strict = False
         columns = _geoparquet_guess_geometry_columns(tab.schema)
 
-    return _geoparquet_table_to_geoarrow(tab, columns)
+    return _geoparquet_table_to_geoarrow(tab, columns, strict=strict)
 
 
 def write_geoparquet_table(
@@ -226,9 +249,85 @@ def _geoparquet_guess_geometry_columns(schema):
     return columns
 
 
+def _geoparquet_encoding_from_extension_type(type):
+    # The encoding label used by the GeoParquet "encoding" column field for a
+    # concrete GeoArrow extension type. WKB/WKT variants all share the WKB/WKT
+    # label; native types use the suffix of the extension name (e.g., "point").
+    if type.encoding in _GEOPARQUET_WKB_ENCODINGS:
+        return "WKB"
+    elif type.encoding in _GEOPARQUET_WKT_ENCODINGS:
+        return "WKT"
+    else:
+        return type._extension_name[len("geoarrow.") :]
+
+
+def _geoparquet_spec_crs(spec):
+    # Resolve the CRS declared by a GeoParquet column specification following
+    # the specification: an absent "crs" key means OGC:CRS84; an explicit null
+    # means the CRS is explicitly unknown.
+    if "crs" not in spec:
+        return _ga.OGC_CRS84
+
+    return _crs.create(spec["crs"])
+
+
+def _geoparquet_crs_equal(spec_crs, extension_crs):
+    # Compare CRS values as defined by the specification. Equivalent
+    # expressions (e.g., a PROJJSON dict and the equivalent PROJJSON string)
+    # are normalized through geoarrow.types.crs before comparison.
+    if spec_crs is None or extension_crs is None:
+        return spec_crs is extension_crs
+
+    return _crs.create(spec_crs) == _crs.create(extension_crs)
+
+
+def _geoparquet_extension_type_conflicts(type, spec):
+    # Compare a column that was read as a GeoArrow extension type against the
+    # per-column specification from the file's "geo" metadata. Returns a list
+    # of human-readable conflict descriptions (an empty list means the
+    # extension type and specification agree).
+    conflicts = []
+
+    if "encoding" in spec:
+        actual_encoding = _geoparquet_encoding_from_extension_type(type)
+        if actual_encoding != spec["encoding"]:
+            conflicts.append(
+                f"encoding mismatch: extension type '{type.extension_name}' "
+                f"encodes as '{actual_encoding}' but the column specification "
+                f"declares encoding '{spec['encoding']}'"
+            )
+
+    spec_crs = _geoparquet_spec_crs(spec)
+    if not _geoparquet_crs_equal(spec_crs, type.crs):
+        if spec_crs is None:
+            spec_crs_repr = "None (explicitly unknown)"
+        else:
+            spec_crs_repr = repr(spec_crs)
+        conflicts.append(
+            "crs mismatch: extension type carries "
+            f"{type.crs!r} but the column specification declares {spec_crs_repr}"
+        )
+
+    spec_edges = spec.get("edges", "planar")
+    if spec_edges in ("planar", "spherical"):
+        actual_edge = type.edge_type.name.lower()
+        if actual_edge != spec_edges:
+            conflicts.append(
+                f"edges mismatch: extension type carries edge type "
+                f"'{actual_edge}' but the column specification declares "
+                f"edges '{spec_edges}'"
+            )
+    else:
+        conflicts.append(f"invalid GeoParquet column edges value {spec_edges!r}")
+
+    return conflicts
+
+
 def _geoparquet_chunked_array_to_geoarrow(item, spec):
     # If item was written as a GeoArrow extension type to the Parquet file,
-    # ignore any information in the column spec
+    # the extension type is authoritative and any information in the column
+    # specification is ignored. Strict verification of the extension type
+    # against the specification happens in _geoparquet_table_to_geoarrow().
     if isinstance(item.type, _ga.GeometryExtensionType):
         return item
 
@@ -265,7 +364,33 @@ def _geoparquet_chunked_array_to_geoarrow(item, spec):
     return item
 
 
-def _geoparquet_table_to_geoarrow(tab, columns):
+def _geoparquet_table_to_geoarrow(tab, columns, strict=False):
+    # In strict mode, collect every extension type / column specification
+    # conflict across all columns before failing so that a single error
+    # describes the full set of problems in the file.
+    all_conflicts = []
+    if strict:
+        for col_name, spec in columns.items():
+            if (
+                col_name in tab.schema.names
+                and isinstance(tab[col_name].type, _ga.GeometryExtensionType)
+            ):
+                all_conflicts.extend(
+                    (col_name, conflict)
+                    for conflict in _geoparquet_extension_type_conflicts(
+                        tab[col_name].type, spec
+                    )
+                )
+
+    if all_conflicts:
+        details = "; ".join(
+            f"column '{name}': {conflict}" for name, conflict in all_conflicts
+        )
+        raise ValueError(
+            "Conflict(s) between GeoArrow extension type(s) and the GeoParquet "
+            f"column specification(s): {details}"
+        )
+
     tab_names = set(tab.schema.names)
     for col_name, spec in columns.items():
         # col_name might not exist if only a subset of columns were read from file
@@ -273,7 +398,7 @@ def _geoparquet_table_to_geoarrow(tab, columns):
             continue
 
         col_i = tab.schema.get_field_index(col_name)
-        new_geometry = _geoparquet_chunked_array_to_geoarrow(tab[col_i], spec)
+        new_geometry = _geoparquet_chunked_array_to_geoarrow(tab[col_name], spec)
         tab = tab.set_column(col_i, col_name, new_geometry)
 
     return tab
@@ -520,6 +645,18 @@ _GEOARROW_ENCODINGS = {
     "multilinestring": _type.multilinestring(),
     "multipolygon": _type.multipolygon(),
 }
+
+_GEOPARQUET_WKB_ENCODINGS = (
+    _ga.Encoding.WKB,
+    _ga.Encoding.LARGE_WKB,
+    _ga.Encoding.WKB_VIEW,
+)
+
+_GEOPARQUET_WKT_ENCODINGS = (
+    _ga.Encoding.WKT,
+    _ga.Encoding.LARGE_WKT,
+    _ga.Encoding.WKT_VIEW,
+)
 
 _CRS_LONLAT = {
     "$schema": "https://proj.org/schemas/v0.7/projjson.schema.json",
